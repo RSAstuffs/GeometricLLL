@@ -21,34 +21,193 @@ import matplotlib.gridspec as gridspec
 from typing import Tuple, List, Optional
 import math
 
+# Import mpmath for arbitrary precision arithmetic
+try:
+    from mpmath import mp, mpf, matrix as mpmatrix
+    MPMATH_AVAILABLE = True
+except ImportError:
+    MPMATH_AVAILABLE = False
+    print("Warning: mpmath not available. Using standard precision (may cause precision loss for large numbers).")
+
 
 class GeometricLLL:
-    """
-    Geometric LLL algorithm implementation.
-
-    Represents factoring N = p*q as geometric transformations:
-    - Square → Triangle → Line → Point
-    """
-
-    def __init__(self, N: int, p: int = None, q: int = None):
-        """
-        Initialize the geometric LLL algorithm.
-
-        Args:
-            N: The number to factor (N = p*q)
-            p: First prime factor (optional, for known factorization)
-            q: Second prime factor (optional, for known factorization)
-        """
+    def __init__(self, N: int, basis=None):
         self.N = N
-        self.p = p
-        self.q = q
-
-        # Geometric representation
-        self.vertices = self._initialize_square()
+        self.p = None
+        self.q = None
+        self.basis = basis if basis is not None else []
+        # Geometric transformation attributes
+        self.vertices = None
         self.transformation_steps = []
+        
+        # Set arbitrary precision for large numbers
+        if MPMATH_AVAILABLE:
+            # Set precision to at least the bit length of N (with extra headroom)
+            n_bits = N.bit_length()
+            # Use at least 2048 bits for RSA-2048, or N's bit length + 100 bits for safety
+            precision_bits = max(2048, n_bits + 100)
+            mp.prec = precision_bits
+            self.use_mpmath = n_bits > 512  # Use mpmath for numbers > 512 bits
+        else:
+            self.use_mpmath = False
 
-        # Animation data
-        self.animation_frames = []
+    def solve_to_front(self) -> Optional[Tuple[int, int]]:
+        """Bridge method for serious_coppersmith_assault.py"""
+        p, q = self.find_factors_geometrically()
+        if p and q:
+            return p, q
+        return None
+
+    def step1_fuse_ab(self, fusion_ratio: float = 1.0) -> np.ndarray:
+        """
+        Step 1: Fuse vertices A and B together.
+        This represents the first geometric transformation in the LLL algorithm.
+        Uses arbitrary precision when needed for large numbers.
+        
+        Args:
+            fusion_ratio: How much to fuse (0.0 = no fusion, 1.0 = complete fusion)
+            
+        Returns:
+            Updated vertices array with A and B fused
+        """
+        if self.vertices is None:
+            # Initialize default square if vertices not set
+            self.vertices = np.array([
+                [0.0, 0.0],      # A
+                [10.0, 0.0],     # B
+                [10.0, 10.0],    # C
+                [0.0, 10.0]      # D
+            ], dtype=np.float64)
+        
+        # Use mpmath for large numbers to avoid precision loss
+        if self.use_mpmath and MPMATH_AVAILABLE:
+            # Convert to mpmath matrix for arbitrary precision
+            vertices_mp = mpmatrix(self.vertices.tolist())
+            
+            # Fuse A and B using mpmath arithmetic
+            midpoint_ab = (vertices_mp[0, :] + vertices_mp[1, :]) / mpf(2.0)
+            fusion_ratio_mp = mpf(fusion_ratio)
+            one_minus_ratio = mpf(1.0) - fusion_ratio_mp
+            
+            # Interpolate using mpmath
+            vertices_mp[0, :] = vertices_mp[0, :] * one_minus_ratio + midpoint_ab * fusion_ratio_mp
+            vertices_mp[1, :] = vertices_mp[1, :] * one_minus_ratio + midpoint_ab * fusion_ratio_mp
+            
+            # Convert back to numpy array
+            vertices = np.array([[float(vertices_mp[i, j]) for j in range(2)] for i in range(4)], dtype=np.float64)
+        else:
+            # Standard numpy operations for smaller numbers
+            vertices = self.vertices.copy().astype(np.float64)
+            
+            # Fuse A and B: move them toward their midpoint
+            midpoint_ab = (vertices[0] + vertices[1]) / 2.0
+            
+            # Interpolate between original positions and midpoint
+            vertices[0] = vertices[0] * (1.0 - fusion_ratio) + midpoint_ab * fusion_ratio
+            vertices[1] = vertices[1] * (1.0 - fusion_ratio) + midpoint_ab * fusion_ratio
+        
+        return vertices
+
+    def step2_compress_cd(self, compression_ratio: float = 1.0) -> np.ndarray:
+        """
+        Step 2: Compress vertices C and D toward their midpoint.
+        This represents the second geometric transformation.
+        Uses arbitrary precision when needed for large numbers.
+        
+        Args:
+            compression_ratio: How much to compress (0.0 = no compression, 1.0 = complete)
+            
+        Returns:
+            Updated vertices array with C and D compressed
+        """
+        if self.vertices is None:
+            self.vertices = np.array([
+                [0.0, 0.0],      # A
+                [10.0, 0.0],    # B
+                [10.0, 10.0],   # C
+                [0.0, 10.0]     # D
+            ], dtype=np.float64)
+        
+        # First ensure A and B are fused (call step1 if needed)
+        if compression_ratio > 0:
+            vertices = self.step1_fuse_ab(1.0)
+        else:
+            vertices = self.vertices.copy().astype(np.float64)
+        
+        # Use mpmath for large numbers
+        if self.use_mpmath and MPMATH_AVAILABLE:
+            vertices_mp = mpmatrix(vertices.tolist())
+            
+            # Compress C and D using mpmath arithmetic
+            midpoint_cd = (vertices_mp[2, :] + vertices_mp[3, :]) / mpf(2.0)
+            comp_ratio_mp = mpf(compression_ratio)
+            one_minus_ratio = mpf(1.0) - comp_ratio_mp
+            
+            vertices_mp[2, :] = vertices_mp[2, :] * one_minus_ratio + midpoint_cd * comp_ratio_mp
+            vertices_mp[3, :] = vertices_mp[3, :] * one_minus_ratio + midpoint_cd * comp_ratio_mp
+            
+            # Convert back to numpy
+            vertices = np.array([[float(vertices_mp[i, j]) for j in range(2)] for i in range(4)], dtype=np.float64)
+        else:
+            # Standard numpy operations
+            # Compress C and D toward their midpoint
+            midpoint_cd = (vertices[2] + vertices[3]) / 2.0
+            
+            # Interpolate between original positions and midpoint
+            vertices[2] = vertices[2] * (1.0 - compression_ratio) + midpoint_cd * compression_ratio
+            vertices[3] = vertices[3] * (1.0 - compression_ratio) + midpoint_cd * compression_ratio
+        
+        return vertices
+
+    def step3_compress_to_point(self, final_ratio: float = 1.0) -> np.ndarray:
+        """
+        Step 3: Compress the entire shape into a single point.
+        This represents the final geometric transformation.
+        Uses arbitrary precision when needed for large numbers.
+        
+        Args:
+            final_ratio: How much to compress (0.0 = no compression, 1.0 = complete to point)
+            
+        Returns:
+            Updated vertices array compressed toward center point
+        """
+        if self.vertices is None:
+            self.vertices = np.array([
+                [0.0, 0.0],      # A
+                [10.0, 0.0],    # B
+                [10.0, 10.0],   # C
+                [0.0, 10.0]     # D
+            ], dtype=np.float64)
+        
+        # First apply steps 1 and 2
+        vertices = self.step1_fuse_ab(1.0)
+        vertices = self.step2_compress_cd(1.0)
+        
+        # Use mpmath for large numbers
+        if self.use_mpmath and MPMATH_AVAILABLE:
+            vertices_mp = mpmatrix(vertices.tolist())
+            
+            # Calculate center point using mpmath
+            center_mp = (vertices_mp[0, :] + vertices_mp[1, :] + vertices_mp[2, :] + vertices_mp[3, :]) / mpf(4.0)
+            final_ratio_mp = mpf(final_ratio)
+            one_minus_ratio = mpf(1.0) - final_ratio_mp
+            
+            # Compress all vertices toward center
+            for i in range(4):
+                vertices_mp[i, :] = vertices_mp[i, :] * one_minus_ratio + center_mp * final_ratio_mp
+            
+            # Convert back to numpy
+            vertices = np.array([[float(vertices_mp[i, j]) for j in range(2)] for i in range(4)], dtype=np.float64)
+        else:
+            # Standard numpy operations
+            # Calculate center point (centroid of all vertices)
+            center = np.mean(vertices, axis=0)
+            
+            # Compress all vertices toward center
+            for i in range(len(vertices)):
+                vertices[i] = vertices[i] * (1.0 - final_ratio) + center * final_ratio
+        
+        return vertices
 
     def _initialize_square(self) -> np.ndarray:
         """
@@ -61,10 +220,8 @@ class GeometricLLL:
         if self.p and self.q:
             # Use actual prime factors for scaling
             # For visualization, we always use a fixed reasonable scale
-            # The actual values don't matter - we just need to show the geometric shape
-            # This ensures the square is always visible regardless of factor size
             scale = 10.0  # Fixed scale for consistent visualization
-            
+
             return np.array([
                 [0.0, 0.0],           # A
                 [scale, 0.0],         # B
@@ -80,82 +237,6 @@ class GeometricLLL:
                 [0.0, 10.0]     # D
             ], dtype=np.float64)
 
-    def step1_fuse_ab(self, fusion_ratio: float = 0.5) -> np.ndarray:
-        """
-        Step 1: Fuse vertices A and B together.
-
-        This creates a triangle by dragging vertices to the sides.
-        The fusion point becomes the midpoint of A and B.
-
-        Args:
-            fusion_ratio: How much to fuse A and B (0.0 = no fusion, 1.0 = complete fusion)
-
-        Returns:
-            Updated vertices after fusion
-        """
-        vertices = self.vertices.copy().astype(np.float64)
-
-        # Calculate fusion point (midpoint of A and B)
-        fusion_point = (vertices[0] + vertices[1]) / 2.0
-
-        # Move A and B towards each other
-        vertices[0] = vertices[0] + fusion_ratio * (fusion_point - vertices[0])
-        vertices[1] = vertices[1] + fusion_ratio * (fusion_point - vertices[1])
-
-        # C and D remain unchanged in this step
-        return vertices
-
-    def step2_compress_cd(self, compression_ratio: float = 0.8) -> np.ndarray:
-        """
-        Step 2: Compress vertices C and D.
-
-        After A and B are fused, compress C and D towards their midpoint,
-        creating a line from the fusion point.
-
-        Args:
-            compression_ratio: How much to compress C and D (0.0 = no compression, 1.0 = complete)
-
-        Returns:
-            Updated vertices after compression
-        """
-        vertices = self.vertices.copy().astype(np.float64)
-
-        # First apply fusion to get current state
-        vertices = self.step1_fuse_ab(fusion_ratio=1.0)
-
-        # Calculate compression point (midpoint of C and D)
-        compression_point = (vertices[2] + vertices[3]) / 2.0
-
-        # Compress C and D towards each other
-        vertices[2] = vertices[2] + compression_ratio * (compression_point - vertices[2])
-        vertices[3] = vertices[3] + compression_ratio * (compression_point - vertices[3])
-
-        return vertices
-
-    def step3_compress_to_point(self, final_ratio: float = 0.9) -> np.ndarray:
-        """
-        Step 3: Compress the resulting line into a single point.
-
-        Args:
-            final_ratio: How much to compress towards center (0.0 = no compression, 1.0 = point)
-
-        Returns:
-            Final point after complete compression
-        """
-        vertices = self.vertices.copy().astype(np.float64)
-
-        # Apply previous transformations
-        vertices = self.step2_compress_cd(compression_ratio=1.0)
-
-        # Calculate center of all remaining points
-        center = np.mean(vertices, axis=0).astype(np.float64)
-
-        # Compress all points towards center
-        for i in range(len(vertices)):
-            vertices[i] = vertices[i] + final_ratio * (center - vertices[i])
-
-        return vertices
-
     def find_factors_geometrically(self, max_iterations: int = 100) -> Tuple[int, int]:
         """
         Execute the geometric LLL algorithm to find factors.
@@ -170,32 +251,21 @@ class GeometricLLL:
         # but represent it geometrically
 
         # Handle large N by using safe sqrt calculation
-        # For very large N, avoid converting to float
-        # Use integer-based approximation for all cases to avoid float conversion errors
         try:
-            # Try to convert to float only if N is small enough
             if self.N <= 1e15:
                 try:
                     sqrt_N = int(math.sqrt(float(self.N))) + 1
                 except (OverflowError, ValueError):
-                    # Even if N <= 1e15, float conversion might fail
-                    # Use integer-based approximation
                     num_bits = self.N.bit_length()
                     estimated_sqrt = 2 ** (num_bits // 2)
                     sqrt_N = min(1000000, estimated_sqrt, self.N // 2)
             else:
-                # For extremely large N, use integer-based approximation
-                # Estimate sqrt using bit length
                 num_bits = self.N.bit_length()
-                # Estimate sqrt: sqrt(2^n) ≈ 2^(n/2)
                 estimated_sqrt = 2 ** (num_bits // 2)
-                # Cap at a reasonable maximum for performance
                 sqrt_N = min(1000000, estimated_sqrt, self.N // 2)
         except (OverflowError, ValueError, TypeError):
-            # Ultimate fallback: use a fixed reasonable maximum
             sqrt_N = min(1000000, self.N // 2)
 
-        # Ensure sqrt_N is at least 2 and reasonable
         sqrt_N = max(2, min(sqrt_N, 1000000))
 
         for i in range(2, sqrt_N):
@@ -217,6 +287,23 @@ class GeometricLLL:
                 return p, q
 
         return None, None
+
+    def _search_fallback(self):
+        # Optimized search for smaller N (fallback only)
+        try:
+            if self.N <= 1e15:
+                limit = math.isqrt(self.N) + 1
+            else:
+                # For very large N, use a reasonable small limit for fallback
+                limit = 1000000
+        except (OverflowError, ValueError):
+            limit = 1000000
+
+        for i in range(2, min(limit, 1000000)):
+            if self.N % i == 0:
+                self.p, self.q = i, self.N // i
+                return self.p, self.q
+        return None
 
     def animate_transformation(self, save_path: str = None) -> None:
         """
