@@ -142,13 +142,91 @@ class GeometricLLL:
 
     def _lll_reduce_basis(self, basis, delta=0.99, verbose=False):
         """
-        Proper LLL reduction with SIZE REDUCTION + SWAPS.
+        GEOMETRIC LLL: Swap based on geometric relationships, not Lovász condition.
         
-        This is the key missing piece! Standard LLL does:
-        1. Size reduce: Make |mu_ij| <= 0.5
-        2. Swap: If ||b*_i|| > delta * ||b*_{i-1}||, swap and go back
+        Key insight: Instead of comparing norms (algebraic), we look at:
+        1. Angular alignment - vectors pointing similar directions should fuse
+        2. Orthogonality gaps - maximize orthogonality through swaps
+        3. Volume preservation - swaps that reduce the "bounding box"
         
-        The delta parameter (0.75 typical, 0.99 for better reduction) controls quality.
+        The geometric intuition: Think of vectors as points in space.
+        We want to "rotate" the basis so shortest vectors emerge naturally.
+        """
+        n = len(basis)
+        if n <= 1:
+            return basis
+        
+        basis = basis.copy()
+        max_iterations = n * n * 5
+        
+        for iteration in range(max_iterations):
+            made_swap = False
+            
+            for k in range(1, n):
+                # Size reduce first (this is standard)
+                for j in range(k-1, -1, -1):
+                    basis[k] = self._reduce_vector(basis[k], basis[j])
+                
+                # GEOMETRIC SWAP CRITERION:
+                # Instead of Lovász, check if swapping improves "geometric quality"
+                
+                # Compute norms
+                norm_k = np.dot(basis[k], basis[k])
+                norm_km1 = np.dot(basis[k-1], basis[k-1])
+                
+                if norm_k == 0 or norm_km1 == 0:
+                    continue
+                
+                # Compute the projection component (how much k lies along k-1)
+                dot_prod = np.dot(basis[k], basis[k-1])
+                
+                # GEOMETRIC CRITERION 1: Projection ratio
+                # If |projection|^2 > norm_k * some_threshold, vectors are too aligned
+                # Swapping can help "rotate" them apart
+                proj_sq = (dot_prod * dot_prod)
+                
+                # GEOMETRIC CRITERION 2: Norm ordering with projection adjustment
+                # Standard LLL: swap if ||b*_k||^2 < (delta - mu^2) ||b*_{k-1}||^2
+                # Geometric version: swap if the "orthogonalized" k is shorter
+                # ||b_k - proj||^2 vs ||b_{k-1}||^2
+                
+                # Orthogonalized component of b_k
+                if norm_km1 > 0:
+                    # b*_k = b_k - (dot/norm_{k-1}) * b_{k-1}
+                    # ||b*_k||^2 = ||b_k||^2 - dot^2/norm_{k-1}
+                    orth_norm_k = norm_k - (proj_sq // norm_km1) if norm_km1 != 0 else norm_k
+                else:
+                    orth_norm_k = norm_k
+                
+                # GEOMETRIC SWAP: Swap if orthogonalized k is much shorter than k-1
+                # This is similar to Lovász but computed geometrically
+                # Use 3/4 ratio (classic LLL) computed with integers
+                # 4 * orth_norm_k < 3 * norm_km1
+                
+                if 4 * orth_norm_k < 3 * norm_km1:
+                    # Swap!
+                    basis[k-1], basis[k] = basis[k].copy(), basis[k-1].copy()
+                    made_swap = True
+                    
+                    if verbose:
+                        print(f"  Geometric swap {k-1}<->{k}: orth_ratio = {float(orth_norm_k)/float(norm_km1):.3f}")
+            
+            if not made_swap:
+                break
+        
+        return basis
+    
+    def _geometric_reorder(self, basis, verbose=False):
+        """
+        PURE GEOMETRIC REORDERING: Sort vectors by a geometric criterion.
+        
+        Instead of iterative swaps, compute a geometric "score" for each vector
+        and reorder accordingly. This is O(n log n) instead of O(n^2).
+        
+        Geometric score: Combination of:
+        - Norm (smaller = better)
+        - Orthogonality to previous vectors (more orthogonal = better)
+        - "Spread" in the coordinate space
         """
         n = len(basis)
         if n <= 1:
@@ -156,78 +234,25 @@ class GeometricLLL:
         
         basis = basis.copy()
         
-        # Gram-Schmidt orthogonalization (computed lazily)
-        def gram_schmidt(B):
-            """Compute Gram-Schmidt orthogonalization."""
-            n = len(B)
-            B_star = [None] * n
-            mu = [[0] * n for _ in range(n)]
+        # Compute geometric scores
+        scores = []
+        for i in range(n):
+            norm_i = np.dot(basis[i], basis[i])
+            if norm_i == 0:
+                scores.append((float('inf'), i))
+                continue
             
-            B_star[0] = B[0].copy()
-            
-            for i in range(1, n):
-                B_star[i] = B[i].copy()
-                for j in range(i):
-                    if np.dot(B_star[j], B_star[j]) == 0:
-                        mu[i][j] = 0
-                    else:
-                        mu[i][j] = np.dot(B[i], B_star[j]) // np.dot(B_star[j], B_star[j])
-                    # Use rational arithmetic for mu to avoid overflow
-                    B_star_j_norm = np.dot(B_star[j], B_star[j])
-                    if B_star_j_norm != 0:
-                        proj_coeff = np.dot(B[i], B_star[j])
-                        # Approximate projection
-                        B_star[i] = B_star[i] - (proj_coeff * B_star[j]) // B_star_j_norm
-            
-            return B_star, mu
+            # Score based on norm (log scale to handle huge integers)
+            norm_bits = norm_i.bit_length() if norm_i > 0 else 0
+            scores.append((norm_bits, i))
         
-        k = 1
-        iterations = 0
-        max_iterations = n * n * 10  # Prevent infinite loops
+        # Sort by score (smallest norm first)
+        scores.sort(key=lambda x: x[0])
         
-        while k < n and iterations < max_iterations:
-            iterations += 1
-            
-            # Size reduce b_k with respect to b_{k-1}
-            basis[k] = self._reduce_vector(basis[k], basis[k-1])
-            
-            # Also reduce against all earlier vectors
-            for j in range(k-1, -1, -1):
-                basis[k] = self._reduce_vector(basis[k], basis[j])
-            
-            # Compute norms for Lovász condition
-            # We use a simplified version: compare ||b_k|| with ||b_{k-1}||
-            norm_k = np.dot(basis[k], basis[k])
-            norm_km1 = np.dot(basis[k-1], basis[k-1])
-            
-            # Lovász condition (simplified): ||b_k||^2 >= (delta - mu^2) * ||b_{k-1}||^2
-            # Approximation: If b_k is significantly shorter, swap
-            
-            # Compute projection coefficient
-            if norm_km1 > 0:
-                mu_k_km1 = np.dot(basis[k], basis[k-1]) / float(norm_km1)
-            else:
-                mu_k_km1 = 0
-            
-            # Check Lovász condition: ||b*_k||^2 >= (delta - mu^2) * ||b*_{k-1}||^2
-            # For large integers, we simplify: swap if ||b_k|| < sqrt(delta) * ||b_{k-1}||
-            # Or equivalently: ||b_k||^2 < delta * ||b_{k-1}||^2
-            
-            lovasz_threshold = int(delta * float(norm_km1))
-            
-            if norm_k > 0 and norm_k < lovasz_threshold:
-                # Lovász condition violated - SWAP
-                if verbose:
-                    print(f"    Swap positions {k-1} and {k}")
-                basis[k-1], basis[k] = basis[k].copy(), basis[k-1].copy()
-                k = max(k - 1, 1)  # Go back
-            else:
-                k += 1
+        # Reorder basis
+        new_basis = np.array([basis[scores[i][1]] for i in range(n)], dtype=object)
         
-        if verbose and iterations >= max_iterations:
-            print(f"    Warning: LLL hit iteration limit ({max_iterations})")
-        
-        return basis
+        return new_basis
 
     def step1_fuse_ab(self, fusion_ratio: float = 0.5) -> np.ndarray:
         if self.vertices.dtype == object:
@@ -390,19 +415,14 @@ class GeometricLLL:
     def run_geometric_reduction(self, verbose: bool = True, 
                                 num_passes: int = 1) -> np.ndarray:
         """
-        Run ROTATING geometric reduction:
+        PURE GEOMETRIC REDUCTION - Hierarchical compression.
         
-        Each pass compresses different pairs in rotation:
-        Pass 1: A-B (adjacent pairs 0-1, 2-3, 4-5...)
-        Pass 2: C-D (offset pairs 1-2, 3-4, 5-6...)  
-        Pass 3: A-C (stride-2 pairs 0-2, 1-3, 2-4...)
-        Pass 4: B-D (another stride pattern)
+        Apply the geometric square compression recursively:
+        1. Group vectors into 4s (A,B,C,D squares)
+        2. Compress each square: A-B fuse, C-D fuse, then to point
+        3. Recurse on the compressed vectors
         
-        This explores the lattice from different "angles"!
-        
-        Args:
-            verbose: Print progress information
-            num_passes: Number of rotation cycles
+        This is O(n) instead of O(n²) - truly geometric!
         """
         if self.basis is None:
             return np.array([])
@@ -415,93 +435,87 @@ class GeometricLLL:
             return basis
         
         if verbose:
-            print(f"[*] Running ROTATING Geometric Reduction on {n}x{m} lattice...")
-            if num_passes > 1:
-                print(f"[*] Rotation cycles: {num_passes}")
+            print(f"[*] Hierarchical Geometric Compression on {n}x{m} lattice...")
         
-        best_basis = basis.copy()
-        best_shortest_norm = None
+        def compress_square(v0, v1, v2, v3):
+            """Compress 4 vectors geometrically - O(1) operation"""
+            # Invert to point same direction as v0
+            if np.dot(v0, v1) < 0: v1 = -v1
+            if np.dot(v0, v2) < 0: v2 = -v2
+            if np.dot(v0, v3) < 0: v3 = -v3
+            
+            # Fuse A-B: reduce v1 against v0
+            d00 = np.dot(v0, v0)
+            if d00 > 0:
+                r = (np.dot(v1, v0) + d00 // 2) // d00
+                if r != 0: v1 = v1 - r * v0
+            
+            # Fuse C-D: reduce v3 against v2
+            d22 = np.dot(v2, v2)
+            if d22 > 0:
+                r = (np.dot(v3, v2) + d22 // 2) // d22
+                if r != 0: v3 = v3 - r * v2
+            
+            # Compress to point: reduce v2 against v0
+            if d00 > 0:
+                r = (np.dot(v2, v0) + d00 // 2) // d00
+                if r != 0: v2 = v2 - r * v0
+            
+            # Also reduce v3 against v0
+            if d00 > 0:
+                r = (np.dot(v3, v0) + d00 // 2) // d00
+                if r != 0: v3 = v3 - r * v0
+            
+            return v0, v1, v2, v3
         
-        # Calculate initial best
-        for i in range(n):
-            norm_sq = np.dot(basis[i], basis[i])
-            if norm_sq > 0:
-                if best_shortest_norm is None or norm_sq < best_shortest_norm:
-                    best_shortest_norm = norm_sq
+        def compress_pair(v0, v1):
+            """Compress 2 vectors - O(1)"""
+            if np.dot(v0, v1) < 0: v1 = -v1
+            d00 = np.dot(v0, v0)
+            if d00 > 0:
+                r = (np.dot(v1, v0) + d00 // 2) // d00
+                if r != 0: v1 = v1 - r * v0
+            return v0, v1
         
-        # Define rotation patterns (which pairs to fuse)
-        patterns = [
-            ("A-B", lambda i, n: [(i, i+1) for i in range(0, n-1, 2)]),      # Adjacent: 0-1, 2-3, 4-5
-            ("C-D", lambda i, n: [(i, i+1) for i in range(1, n-1, 2)]),      # Offset: 1-2, 3-4, 5-6
-            ("A-C", lambda i, n: [(i, i+2) for i in range(0, n-2)]),         # Stride-2: 0-2, 1-3, 2-4
-            ("B-D", lambda i, n: [(i, i+3) for i in range(0, n-3)]),         # Stride-3: 0-3, 1-4, 2-5
-        ]
+        # === HIERARCHICAL COMPRESSION ===
+        # Process in groups of 4 (like the geometric square)
         
-        for pass_num in range(num_passes):
-            pattern_idx = pass_num % len(patterns)
-            pattern_name, get_pairs = patterns[pattern_idx]
-            
-            if verbose:
-                print(f"\n[*] === ROTATION {pass_num + 1}/{num_passes}: {pattern_name} ===")
-            
-            # Get pairs for this pattern
-            pairs = get_pairs(0, n)
-            
-            if verbose:
-                print(f"[*] Compressing pairs: {pairs[:4]}{'...' if len(pairs) > 4 else ''}")
-            
-            # ===== COMPRESS using current pattern =====
-            # First, fuse the specified pairs
-            for (i, j) in pairs:
-                if i < n and j < n:
-                    basis[j] = self._reduce_vector(basis[j], basis[i])
-            
-            # NEW: Apply proper LLL with swaps!
-            basis = self._lll_reduce_basis(basis, delta=0.99, verbose=False)
-            
-            # Then do full forward reduction
-            for i in range(1, n):
-                for j in range(i):
-                    basis[i] = self._reduce_vector(basis[i], basis[j])
-            
-            # Backward reduction
-            for i in range(n - 2, -1, -1):
-                for j in range(i + 1, n):
-                    basis[i] = self._reduce_vector(basis[i], basis[j])
-            
-            # Check if we found better
-            current_shortest = None
-            for i in range(n):
-                norm_sq = np.dot(basis[i], basis[i])
-                if norm_sq > 0:
-                    if current_shortest is None or norm_sq < current_shortest:
-                        current_shortest = norm_sq
-            
-            if verbose:
-                bits = current_shortest.bit_length() // 2 if current_shortest else 0
-                print(f"[*] Shortest after {pattern_name}: ~2^{bits} bits")
-            
-            if best_shortest_norm is None or (current_shortest and current_shortest < best_shortest_norm):
-                best_shortest_norm = current_shortest
-                best_basis = basis.copy()
-                if verbose:
-                    print(f"[*] ★ New best found!")
-            
-            # ===== EXPAND before next rotation =====
-            if pass_num < num_passes - 1:
-                # Expand using REVERSE of current pattern
-                reverse_pairs = list(reversed(pairs))
-                for (i, j) in reverse_pairs[:len(reverse_pairs)//2]:
-                    if i < n and j < n:
-                        # Add vectors to expand
-                        basis[i] = basis[i] + basis[j]
+        # Level 1: Compress all groups of 4
+        i = 0
+        while i + 3 < n:
+            basis[i], basis[i+1], basis[i+2], basis[i+3] = compress_square(
+                basis[i], basis[i+1], basis[i+2], basis[i+3]
+            )
+            i += 4
+        
+        # Handle remaining 2-3 vectors
+        if i + 1 < n:
+            basis[i], basis[i+1] = compress_pair(basis[i], basis[i+1])
+            if i + 2 < n:
+                basis[i], basis[i+2] = compress_pair(basis[i], basis[i+2])
+        
+        # Level 2: Compress across groups (reduce each group leader against first)
+        for i in range(4, n, 4):
+            if np.dot(basis[0], basis[i]) < 0:
+                basis[i] = -basis[i]
+            d00 = np.dot(basis[0], basis[0])
+            if d00 > 0:
+                r = (np.dot(basis[i], basis[0]) + d00 // 2) // d00
+                if r != 0:
+                    basis[i] = basis[i] - r * basis[0]
+        
+        # Sort by norm
+        norms = [(np.dot(basis[i], basis[i]), i) for i in range(n)]
+        norms.sort()
+        basis = np.array([basis[idx] for _, idx in norms], dtype=object)
         
         if verbose:
-            best_bits = best_shortest_norm.bit_length() // 2 if best_shortest_norm else 0
-            print(f"\n[*] Rotation complete. Best shortest: ~2^{best_bits} bits")
+            shortest = norms[0][0]
+            bits = shortest.bit_length() // 2 if shortest and shortest > 0 else 0
+            print(f"[*] Shortest: ~2^{bits} bits")
         
-        self.basis = best_basis
-        return best_basis
+        self.basis = basis
+        return basis
 
 
 
