@@ -69,6 +69,13 @@ class CoppersmithGUI:
         self.max_rels_entry = ttk.Entry(params_frame, textvariable=self.max_rels_var, width=12)
         self.max_rels_entry.grid(row=2, column=1, sticky="w", padx=5)
         
+        # Number of LLL passes
+        ttk.Label(params_frame, text="LLL Passes:").grid(row=3, column=0, sticky="w", padx=5)
+        self.num_passes_var = tk.StringVar(value="1")
+        self.num_passes_spin = ttk.Spinbox(params_frame, from_=1, to=10, textvariable=self.num_passes_var, width=10)
+        self.num_passes_spin.grid(row=3, column=1, sticky="w", padx=5)
+        ttk.Label(params_frame, text="(more = better reduction, slower)").grid(row=3, column=2, sticky="w")
+        
         # Search bound multiplier
         ttk.Label(params_frame, text="Bound Mult:").grid(row=0, column=3, sticky="w", padx=5)
         self.bound_mult_var = tk.StringVar(value="2")
@@ -82,7 +89,7 @@ class CoppersmithGUI:
         
         # Use geometric LLL checkbox
         self.use_geom_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(params_frame, text="Try Geometric LLL First", variable=self.use_geom_var).grid(
+        ttk.Checkbutton(params_frame, text="Pure Geometric LLL", variable=self.use_geom_var).grid(
             row=2, column=3, columnspan=2, sticky="w", padx=5)
         
         # === BUTTONS ===
@@ -172,6 +179,7 @@ class CoppersmithGUI:
             max_mod_bits = int(self.max_mod_bits_var.get())
             max_rels = int(self.max_rels_var.get())
             bound_mult = int(self.bound_mult_var.get())
+            num_passes = int(self.num_passes_var.get())
             verbose = self.verbose_var.get()
             use_geom = self.use_geom_var.get()
             
@@ -179,7 +187,8 @@ class CoppersmithGUI:
             self.log(f"COPPERSMITH ATTACK")
             self.log(f"=" * 60)
             self.log(f"N: {N.bit_length()}-bit number")
-            self.log(f"Parameters: m={m}, max_mod_bits={max_mod_bits}, max_rels={max_rels}")
+            self.log(f"Parameters: m={m}, passes={num_passes}")
+            self.log(f"Relationships: max_mod_bits={max_rels}, max_rels={max_rels}")
             self.log("")
             
             # Import modules
@@ -259,6 +268,7 @@ class CoppersmithGUI:
             
             self.log(f"   Search bound: ~2^{search_bound.bit_length()} ({search_bound:.2e})")
             self.log(f"   Lattice dimension: {m+1}D")
+            self.log(f"   Geometric passes: {num_passes}")
             
             method = CoppersmithMethod(N, polynomial, degree=1)
             
@@ -267,7 +277,10 @@ class CoppersmithGUI:
             sys.stdout = OutputCapture(self.log)
             
             try:
-                roots = method.find_small_roots(X=search_bound, m=m, verbose=verbose)
+                roots = method.find_small_roots(
+                    X=search_bound, m=m, verbose=verbose,
+                    num_passes=num_passes
+                )
             finally:
                 sys.stdout = old_stdout
             
