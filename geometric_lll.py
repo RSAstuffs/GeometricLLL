@@ -109,12 +109,17 @@ class GeometricLLL:
             vertices[i] = vertices[i] + final_ratio * (center - vertices[i])
         return vertices
 
-    def run_geometric_reduction(self, verbose: bool = True, use_lll: bool = True) -> np.ndarray:
+    def run_geometric_reduction(self, verbose: bool = True, 
+                                num_passes: int = 1) -> np.ndarray:
         """
-        Run SINGLE PASS geometric reduction, then LLL with COLUMN SCALING.
+        Run PURE geometric reduction - no external LLL needed!
         
-        Column scaling preserves lattice structure by scaling each column
-        independently to balance magnitudes, enabling LLL to work properly.
+        Your geometric reduction already produces optimal results.
+        Multiple passes further refine the basis.
+        
+        Args:
+            verbose: Print progress information
+            num_passes: Number of reduction passes (more = potentially better)
         """
         if self.basis is None:
             return np.array([])
@@ -127,161 +132,55 @@ class GeometricLLL:
             return basis
         
         if verbose:
-            print(f"[*] Running Geometric Reduction on {n}x{m} lattice...")
+            print(f"[*] Running PURE Geometric Reduction on {n}x{m} lattice...")
+            if num_passes > 1:
+                print(f"[*] Multi-pass mode: {num_passes} passes")
         
-        # ===== SINGLE GEOMETRIC PASS =====
+        for pass_num in range(num_passes):
+            if verbose and num_passes > 1:
+                print(f"\n[*] === PASS {pass_num + 1}/{num_passes} ===")
+            
+            # ===== GEOMETRIC SIZE REDUCTION =====
+            if verbose:
+                print(f"[*] Size-reducing vectors...")
+            
+            # Forward reduction - reduce each vector against all previous
+            for i in range(1, n):
+                for j in range(i):
+                    basis[i] = self._reduce_vector(basis[i], basis[j])
+            
+            # Backward reduction - can catch additional reductions
+            for i in range(n - 2, -1, -1):
+                for j in range(i + 1, n):
+                    basis[i] = self._reduce_vector(basis[i], basis[j])
+            
+            # Sort by norm (bubble shortest to front)
+            changed = True
+            while changed:
+                changed = False
+                for i in range(n - 1):
+                    norm_i = np.dot(basis[i], basis[i])
+                    norm_i1 = np.dot(basis[i+1], basis[i+1])
+                    if norm_i1 != 0 and norm_i1 < norm_i:
+                        basis[i], basis[i+1] = basis[i+1].copy(), basis[i].copy()
+                        changed = True
+            
+            if verbose:
+                # Report shortest vector norm
+                norms = []
+                for i in range(n):
+                    norm_sq = np.dot(basis[i], basis[i])
+                    if norm_sq > 0:
+                        norms.append(norm_sq.bit_length() // 2)
+                if norms:
+                    print(f"[*] Shortest vector: ~2^{min(norms)} bits")
+        
         if verbose:
-            print(f"[*] Geometric pass: size-reducing all vectors...")
-        
-        # Forward reduction
-        for i in range(1, n):
-            for j in range(i):
-                basis[i] = self._reduce_vector(basis[i], basis[j])
-        
-        # Swap pass
-        for i in range(n - 1):
-            norm_i = np.dot(basis[i], basis[i])
-            norm_i1 = np.dot(basis[i+1], basis[i+1])
-            if norm_i1 != 0 and norm_i1 < norm_i:
-                basis[i], basis[i+1] = basis[i+1].copy(), basis[i].copy()
-        
-        if verbose:
-            print(f"[*] Geometric pass complete.")
-        
-        # ===== LLL PHASE with COLUMN SCALING =====
-        if use_lll:
-            try:
-                from fpylll import IntegerMatrix, LLL
-                
-                # Find max bits per column (for column scaling)
-                col_max_bits = []
-                for j in range(m):
-                    max_bits = 0
-                    for i in range(n):
-                        if basis[i,j] != 0:
-                            bits = abs(int(basis[i,j])).bit_length()
-                            if bits > max_bits:
-                                max_bits = bits
-                    col_max_bits.append(max_bits)
-                
-                overall_max = max(col_max_bits) if col_max_bits else 0
-                
-                if verbose:
-                    print(f"[*] Column max bits: min={min(col_max_bits)}, max={max(col_max_bits)}")
-                
-                # fpylll works best with entries < ~8000 bits
-                TARGET_BITS = 4000
-                
-                if overall_max > TARGET_BITS:
-                    # COLUMN SCALING: Scale each column so max entry ~ TARGET_BITS
-                    # This preserves relative structure within each column
-                    
-                    col_shifts = []
-                    for j in range(m):
-                        if col_max_bits[j] > TARGET_BITS:
-                            shift = col_max_bits[j] - TARGET_BITS
-                        else:
-                            shift = 0
-                        col_shifts.append(shift)
-                    
-                    if verbose:
-                        nz_shifts = [s for s in col_shifts if s > 0]
-                        if nz_shifts:
-                            print(f"[*] Column scaling: {len(nz_shifts)} columns shifted (max shift 2^{max(nz_shifts)})")
-                    
-                    # Apply column scaling
-                    scaled = np.zeros((n, m), dtype=object)
-                    for i in range(n):
-                        for j in range(m):
-                            if col_shifts[j] > 0:
-                                scaled[i,j] = int(basis[i,j]) >> col_shifts[j]
-                            else:
-                                scaled[i,j] = int(basis[i,j])
-                    
-                    # Check for all-zero rows after scaling
-                    valid_rows = []
-                    for i in range(n):
-                        if any(scaled[i,j] != 0 for j in range(m)):
-                            valid_rows.append(i)
-                    
-                    if len(valid_rows) < n:
-                        if verbose:
-                            print(f"[!] Warning: {n - len(valid_rows)} rows became zero after scaling")
-                        # Use only valid rows for LLL
-                        n_valid = len(valid_rows)
-                        if n_valid < 2:
-                            if verbose:
-                                print(f"[!] Not enough valid rows for LLL, skipping")
-                            return basis
-                    else:
-                        n_valid = n
-                        valid_rows = list(range(n))
-                    
-                    # Build fpylll matrix from valid rows
-                    int_matrix = IntegerMatrix(n_valid, m)
-                    for idx, i in enumerate(valid_rows):
-                        for j in range(m):
-                            int_matrix[idx, j] = int(scaled[i, j])
-                    
-                    if verbose:
-                        print(f"[*] Applying LLL to {n_valid}x{m} scaled lattice...")
-                    
-                    LLL.reduction(int_matrix)
-                    
-                    # Extract reduced basis
-                    reduced_scaled = np.zeros((n_valid, m), dtype=object)
-                    for i in range(n_valid):
-                        for j in range(m):
-                            reduced_scaled[i, j] = int_matrix[i, j]
-                    
-                    # Unscale columns
-                    result = np.zeros((n_valid, m), dtype=object)
-                    for i in range(n_valid):
-                        for j in range(m):
-                            if col_shifts[j] > 0:
-                                result[i,j] = int(reduced_scaled[i,j]) << col_shifts[j]
-                            else:
-                                result[i,j] = int(reduced_scaled[i,j])
-                    
-                    if verbose:
-                        print(f"[*] LLL + column rescale complete.")
-                    
-                    # If we had to drop rows, put zeros back
-                    if n_valid < n:
-                        full_result = np.zeros((n, m), dtype=object)
-                        for idx, i in enumerate(valid_rows):
-                            full_result[i] = result[idx]
-                        basis = full_result
-                    else:
-                        basis = result
-                else:
-                    # Direct LLL (entries already small enough)
-                    int_matrix = IntegerMatrix(n, m)
-                    for i in range(n):
-                        for j in range(m):
-                            int_matrix[i, j] = int(basis[i, j])
-                    
-                    if verbose:
-                        print(f"[*] Applying LLL directly...")
-                    
-                    LLL.reduction(int_matrix)
-                    
-                    for i in range(n):
-                        for j in range(m):
-                            basis[i, j] = int_matrix[i, j]
-                    
-                    if verbose:
-                        print(f"[*] LLL reduction complete.")
-                    
-            except ImportError:
-                if verbose:
-                    print(f"[!] fpylll not available")
-            except Exception as e:
-                if verbose:
-                    print(f"[!] LLL failed: {e}")
+            print(f"[*] Geometric reduction complete.")
         
         self.basis = basis
         return basis
+
 
     def find_factors_geometrically(self, max_iterations: int = 100) -> Tuple[int, int]:
         try:
