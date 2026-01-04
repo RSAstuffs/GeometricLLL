@@ -198,9 +198,15 @@ class CoppersmithMethod:
         
         return B
     
-    def reduce_lattice_geometric(self, lattice: np.ndarray, verbose: bool = True) -> np.ndarray:
+    def reduce_lattice_geometric(self, lattice: np.ndarray, verbose: bool = True,
+                                  num_passes: int = 1) -> np.ndarray:
         """
         Reduce the lattice using GeometricLLL's PURE geometric transformations.
+        
+        Args:
+            lattice: Input lattice basis
+            verbose: Print progress
+            num_passes: Number of reduction passes (more = potentially shorter vectors)
         """
         if lattice.dtype != object:
             lattice = lattice.astype(object)
@@ -210,7 +216,10 @@ class CoppersmithMethod:
         if verbose:
             print("[*] Applying PURE geometric reduction (Fuse/Compress passes)...")
         
-        reduced_basis = geom_lll.run_geometric_reduction()
+        reduced_basis = geom_lll.run_geometric_reduction(
+            verbose=verbose, 
+            num_passes=num_passes
+        )
         
         return reduced_basis
     
@@ -258,15 +267,24 @@ class CoppersmithMethod:
         
         return None
     
-    def find_small_roots(self, X: int, m: int = 3, verbose: bool = True) -> List[int]:
+    def find_small_roots(self, X: int, m: int = 3, verbose: bool = True,
+                         num_passes: int = 1) -> List[int]:
         """
         Find small roots of f(x) ≡ 0 (mod N) where |x| < X.
+        
+        Args:
+            X: Search bound for roots
+            m: Lattice parameter (more rows = more constraints)
+            verbose: Print progress
+            num_passes: Number of geometric reduction passes
         """
         if verbose:
             print(f"[*] Coppersmith's method: Finding roots |x| < {X} (mod N)")
             print(f"[*] N has {self.N.bit_length()} bits")
             print(f"[*] Using PURE Geometric LLL for lattice reduction")
             print(f"[*] Lattice parameter m = {m}, polynomial degree = {self.degree}")
+            if num_passes > 1:
+                print(f"[*] Multi-pass mode: {num_passes} passes")
         
         if verbose:
             print("[*] Constructing integer lattice basis...")
@@ -277,7 +295,10 @@ class CoppersmithMethod:
             print(f"[*] Lattice dimension: {lattice.shape}")
             print("[*] Reducing lattice using Geometric LLL...")
         
-        reduced_basis = self.reduce_lattice_geometric(lattice, verbose)
+        reduced_basis = self.reduce_lattice_geometric(
+            lattice, verbose, 
+            num_passes=num_passes
+        )
         
         if verbose:
             print("[*] Lattice reduction complete")
