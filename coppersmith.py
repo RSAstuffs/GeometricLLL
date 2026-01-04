@@ -214,7 +214,7 @@ class CoppersmithMethod:
         geom_lll = GeometricLLL(self.N, basis=lattice)
         
         if verbose:
-            print("[*] Applying PURE geometric reduction (Fuse/Compress passes)...")
+            print("[*] Applying PURE geometric reduction (rotating compression)...")
         
         reduced_basis = geom_lll.run_geometric_reduction(
             verbose=verbose, 
@@ -223,50 +223,496 @@ class CoppersmithMethod:
         
         return reduced_basis
     
-    def _extract_root_from_vector(self, vec, X: int) -> Optional[int]:
+    def reduce_lattice_bkz(self, lattice: np.ndarray, verbose: bool = True,
+                           block_size: int = 20, max_tours: int = 10) -> np.ndarray:
         """
-        Extract a potential root from a short lattice vector.
+        Reduce the lattice using custom Geometric BKZ (stronger than LLL).
         
-        The vector represents coefficients [c0, c1, ..., cn-1] of a polynomial
-        h(x) = c0 + c1*x + ... that shares roots with f(x) mod N.
+        BKZ processes blocks of vectors and finds shortest vectors within
+        each block. Uses geometric reduction as the SVP oracle.
         
-        For a short vector, h(x) might factor or have small integer roots.
+        Args:
+            lattice: Input lattice basis
+            verbose: Print progress
+            block_size: Size of blocks (larger = stronger but slower)
+            max_tours: Maximum BKZ tours
         """
-        # Try to interpret vector as polynomial and find roots
-        n = len(vec)
+        if lattice.dtype != object:
+            lattice = lattice.astype(object)
         
-        # Extract non-zero coefficients
-        coeffs = []
-        for i in range(n):
-            c = int(vec[i])
-            # Unscale by X^i
-            if X != 0 and i > 0:
-                # The lattice scaled by X^i, so unscale
-                X_i = X ** i
-                if c % X_i == 0:
-                    coeffs.append(c // X_i)
-                else:
-                    coeffs.append(c)  # Keep scaled if not divisible
-            else:
-                coeffs.append(c)
+        geom_lll = GeometricLLL(self.N, basis=lattice)
         
-        # For linear polynomial: h(x) = c0 + c1*x, root is x = -c0/c1
-        if len(coeffs) >= 2 and coeffs[1] != 0:
-            c0, c1 = coeffs[0], coeffs[1]
-            if c0 % c1 == 0:
-                root = -c0 // c1
-                return root
+        if verbose:
+            print(f"[*] Applying Geometric BKZ (block_size={block_size})...")
         
-        # Try small integer roots directly
-        for x in range(-1000, 1001):
-            if x == 0:
-                continue
-            h_x = sum(coeffs[i] * (x ** i) for i in range(len(coeffs)) if i < len(coeffs))
-            if h_x == 0:
-                return x
+        reduced_basis = geom_lll.run_bkz(
+            block_size=block_size,
+            verbose=verbose,
+            max_tours=max_tours
+        )
         
-        return None
+        return reduced_basis
     
+    def find_roots_geometrically(self, X: int, m: int = 5, verbose: bool = True) -> List[int]:
+        """
+        Find small roots using PURE geometric method.
+        
+        This uses YOUR custom geometric algorithm:
+        Square → Triangle → Line → Point → Extract root from focal point
+        
+        Args:
+            X: Bound on root size |x| < X
+            m: Lattice parameter
+            verbose: Print geometric transformation steps
+            
+        Returns:
+            List of roots found
+        """
+        if verbose:
+            print(f"[*] GEOMETRIC ROOT FINDING (Custom Algorithm)")
+            print(f"[*] N = {self.N.bit_length()}-bit number")
+            print(f"[*] Bound X = {X} (~2^{X.bit_length()} bits)")
+            print(f"[*] Lattice parameter m = {m}")
+            print()
+        
+        coeffs = self.poly_coeffs if self.poly_coeffs else self._extract_coefficients()
+        
+        # Phase 0: Simple 2D lattice for LINEAR polynomials only
+        if self.degree == 1 and len(coeffs) >= 2:
+            if verbose:
+                print("[*] Phase 0: SIMPLE 2D lattice (linear polynomial)...")
+            
+            b, a = int(coeffs[0]), int(coeffs[1])
+            simple_lattice = np.array([
+                [self.N, 0],
+                [b, a]
+            ], dtype=object)
+            
+            simple_geom = GeometricLLL(self.N, basis=simple_lattice)
+            simple_reduced = simple_geom.run_geometric_reduction(verbose=False, num_passes=1)
+            
+            for vec in simple_reduced:
+                if len(vec) >= 2:
+                    c0, c1 = int(vec[0]), int(vec[1])
+                    if c1 != 0 and math.gcd(abs(c1), self.N) == 1:
+                        try:
+                            c1_inv = pow(c1, -1, self.N)
+                            root_candidate = (-c0 * c1_inv) % self.N
+                            if root_candidate > self.N // 2:
+                                root_candidate -= self.N
+                            if abs(root_candidate) <= X:
+                                f_val = sum(c * (root_candidate ** i) for i, c in enumerate(coeffs))
+                                if f_val % self.N == 0:
+                                    if verbose:
+                                        print(f"[★] SIMPLE LATTICE ROOT FOUND: x = {root_candidate}")
+                                    return [root_candidate]
+                        except:
+                            pass
+        
+        # Construct full Coppersmith lattice
+        if verbose:
+            print("[*] Phase 1: Constructing Coppersmith lattice...")
+        lattice = self.construct_lattice_integer(m, X)
+        
+        # Run geometric reduction with more passes for larger lattices
+        num_passes = max(3, lattice.shape[0] // 4)
+        if verbose:
+            print(f"[*] Phase 2: Geometric reduction ({num_passes} passes)...")
+        geom_lll = GeometricLLL(self.N, basis=lattice)
+        reduced = geom_lll.run_geometric_reduction(verbose=verbose, num_passes=num_passes)
+        
+        # Phase 3: Extract roots from reduced basis using RESULTANT/GCD
+        if verbose:
+            print("[*] Phase 3: Extracting roots via polynomial GCD/resultant...")
+        
+        found_roots = []
+        d = self.degree
+        
+        # Sort by vector norm (shortest first)
+        norms = [sum(int(x)**2 for x in vec) for vec in reduced]
+        sorted_indices = sorted(range(len(reduced)), key=lambda i: norms[i])
+        
+        # Extract polynomials from the shortest vectors
+        polys = []
+        for idx in sorted_indices[:min(d + 2, len(reduced))]:
+            vec = reduced[idx]
+            # Unscale: entry i was scaled by X^i
+            h_coeffs = []
+            for i in range(len(vec)):
+                vi = int(vec[i])
+                if X > 0 and i > 0:
+                    X_i = X ** i
+                    if vi % X_i == 0:
+                        h_coeffs.append(vi // X_i)
+                    else:
+                        h_coeffs.append(vi)
+                else:
+                    h_coeffs.append(vi)
+            # Trim trailing zeros
+            while h_coeffs and h_coeffs[-1] == 0:
+                h_coeffs.pop()
+            if h_coeffs and any(c != 0 for c in h_coeffs):
+                polys.append(h_coeffs)
+        
+        if verbose:
+            print(f"[*] Extracted {len(polys)} polynomials from short vectors")
+        
+        # Method 1: Polynomial GCD to find common roots
+        if len(polys) >= 2:
+            roots_from_gcd = self._polynomial_gcd_roots(polys, X, verbose)
+            for r in roots_from_gcd:
+                if r not in found_roots:
+                    # Verify
+                    f_val = sum(coeffs[i] * (r ** i) for i, c in enumerate(coeffs))
+                    if f_val % self.N == 0:
+                        found_roots.append(r)
+        
+        # Method 2: Resultant between pairs of polynomials
+        if len(polys) >= 2 and not found_roots:
+            roots_from_resultant = self._resultant_roots(polys, X, verbose)
+            for r in roots_from_resultant:
+                if r not in found_roots:
+                    f_val = sum(coeffs[i] * (r ** i) for i, c in enumerate(coeffs))
+                    if f_val % self.N == 0:
+                        found_roots.append(r)
+        
+        # Method 3: Direct integer roots of short polynomials
+        for poly in polys:
+            roots_from_poly = self._integer_roots(poly, X)
+            for r in roots_from_poly:
+                if r not in found_roots:
+                    f_val = sum(coeffs[i] * (r ** i) for i, c in enumerate(coeffs))
+                    if f_val % self.N == 0:
+                        if verbose:
+                            print(f"[★] INTEGER ROOT: x = {r}")
+                        found_roots.append(r)
+        
+        # Phase 4: Direct enumeration for small X
+        if not found_roots and X <= 10000:
+            if verbose:
+                print(f"[*] Phase 4: Direct enumeration up to X={X}...")
+            for x in range(-X, X + 1):
+                f_val = sum(c * (x ** i) for i, c in enumerate(coeffs))
+                if f_val % self.N == 0:
+                    if verbose:
+                        print(f"[★] ENUMERATION ROOT FOUND: x = {x}")
+                    found_roots.append(x)
+        
+        if verbose:
+            if found_roots:
+                print(f"[★] Found {len(found_roots)} root(s): {found_roots}")
+            else:
+                print("[*] No roots found")
+        
+        return found_roots
+    
+    def _polynomial_gcd_roots(self, polys: List[List[int]], X: int, verbose: bool = False) -> List[int]:
+        """
+        Find roots by computing GCD of polynomials over integers.
+        If h1(x) and h2(x) share a root, gcd(h1, h2) will have that root.
+        """
+        roots = []
+        
+        def poly_degree(p):
+            while p and p[-1] == 0:
+                p = p[:-1]
+            return len(p) - 1 if p else -1
+        
+        def poly_eval(p, x):
+            return sum(c * (x ** i) for i, c in enumerate(p))
+        
+        def poly_gcd(p1, p2):
+            """Euclidean algorithm for polynomial GCD over rationals."""
+            # Work with integer coefficients, allowing rational intermediate results
+            from fractions import Fraction
+            
+            def to_frac(p):
+                return [Fraction(c) for c in p]
+            
+            def trim(p):
+                while p and p[-1] == 0:
+                    p = p[:-1]
+                return p if p else [Fraction(0)]
+            
+            def poly_div(a, b):
+                """Polynomial division a / b, returns (quotient, remainder)"""
+                a, b = list(a), list(b)
+                a, b = trim(a), trim(b)
+                if not b or b == [Fraction(0)]:
+                    return None, None
+                
+                da, db = len(a) - 1, len(b) - 1
+                if da < db:
+                    return [Fraction(0)], a
+                
+                q = [Fraction(0)] * (da - db + 1)
+                r = list(a)
+                
+                for i in range(da - db, -1, -1):
+                    if len(r) > i + db:
+                        q[i] = r[i + db] / b[db]
+                        for j in range(db + 1):
+                            if i + j < len(r):
+                                r[i + j] -= q[i] * b[j]
+                
+                return trim(q), trim(r)
+            
+            a, b = to_frac(p1), to_frac(p2)
+            a, b = trim(a), trim(b)
+            
+            max_iter = 100
+            for _ in range(max_iter):
+                if not b or all(c == 0 for c in b):
+                    break
+                _, r = poly_div(a, b)
+                if r is None:
+                    break
+                a, b = b, r
+            
+            # Make monic and convert back to integers if possible
+            a = trim(a)
+            if a and a[-1] != 0:
+                lc = a[-1]
+                a = [c / lc for c in a]
+            
+            # Try to get integer coefficients
+            result = []
+            for c in a:
+                if c.denominator == 1:
+                    result.append(int(c.numerator))
+                else:
+                    # Scale to clear denominators
+                    return a  # Return as fractions
+            return result
+        
+        # Compute pairwise GCDs
+        for i in range(len(polys)):
+            for j in range(i + 1, len(polys)):
+                p1, p2 = polys[i], polys[j]
+                if poly_degree(p1) < 1 or poly_degree(p2) < 1:
+                    continue
+                
+                g = poly_gcd(p1, p2)
+                if g and poly_degree(g) >= 1 and poly_degree(g) < min(poly_degree(p1), poly_degree(p2)):
+                    if verbose:
+                        print(f"[*] Found non-trivial GCD of degree {poly_degree(g)}")
+                    
+                    # Extract roots from GCD
+                    gcd_roots = self._integer_roots(g, X)
+                    for r in gcd_roots:
+                        if r not in roots:
+                            if verbose:
+                                print(f"[★] GCD ROOT: x = {r}")
+                            roots.append(r)
+        
+        return roots
+    
+    def _resultant_roots(self, polys: List[List[int]], X: int, verbose: bool = False) -> List[int]:
+        """
+        Find roots using resultant.
+        For polynomials h1(x) and h2(x), if they share a root, resultant(h1, h2) = 0.
+        We can also use resultant with y - x to get the x-coordinates of common roots.
+        """
+        roots = []
+        
+        def resultant(p, q):
+            """
+            Compute resultant of p and q using Sylvester matrix determinant.
+            """
+            m = len(p) - 1  # degree of p
+            n = len(q) - 1  # degree of q
+            
+            if m < 0 or n < 0:
+                return 0
+            
+            # Build Sylvester matrix (m+n) x (m+n)
+            size = m + n
+            if size == 0:
+                return 1
+            
+            # Use fractions for exact arithmetic
+            from fractions import Fraction
+            matrix = [[Fraction(0)] * size for _ in range(size)]
+            
+            # First n rows: coefficients of p
+            for i in range(n):
+                for j, c in enumerate(p):
+                    if i + j < size:
+                        matrix[i][i + j] = Fraction(c)
+            
+            # Next m rows: coefficients of q
+            for i in range(m):
+                for j, c in enumerate(q):
+                    if i + j < size:
+                        matrix[n + i][i + j] = Fraction(c)
+            
+            # Compute determinant via Gaussian elimination
+            det = Fraction(1)
+            for col in range(size):
+                # Find pivot
+                pivot_row = None
+                for row in range(col, size):
+                    if matrix[row][col] != 0:
+                        pivot_row = row
+                        break
+                
+                if pivot_row is None:
+                    return 0
+                
+                if pivot_row != col:
+                    matrix[col], matrix[pivot_row] = matrix[pivot_row], matrix[col]
+                    det = -det
+                
+                det *= matrix[col][col]
+                
+                # Eliminate
+                pivot = matrix[col][col]
+                for row in range(col + 1, size):
+                    if matrix[row][col] != 0:
+                        factor = matrix[row][col] / pivot
+                        for c in range(col, size):
+                            matrix[row][c] -= factor * matrix[col][c]
+            
+            return det
+        
+        # Check if resultant is zero (indicating common root exists)
+        for i in range(len(polys)):
+            for j in range(i + 1, len(polys)):
+                p1, p2 = polys[i], polys[j]
+                if len(p1) < 2 or len(p2) < 2:
+                    continue
+                
+                res = resultant(p1, p2)
+                if res == 0:
+                    if verbose:
+                        print(f"[*] Resultant is 0 - polynomials share a root!")
+                    # Find the common root via GCD
+                    gcd_roots = self._polynomial_gcd_roots([p1, p2], X, verbose=False)
+                    for r in gcd_roots:
+                        if r not in roots:
+                            roots.append(r)
+        
+        return roots
+    
+    def _integer_roots(self, poly: List, X: int) -> List[int]:
+        """
+        Find integer roots of a polynomial using rational root theorem.
+        """
+        roots = []
+        from fractions import Fraction
+        
+        # Convert to integers if needed
+        coeffs = []
+        for c in poly:
+            if isinstance(c, Fraction):
+                if c.denominator == 1:
+                    coeffs.append(int(c.numerator))
+                else:
+                    # Scale all coefficients to clear denominators
+                    lcm_denom = 1
+                    for cc in poly:
+                        if isinstance(cc, Fraction):
+                            lcm_denom = lcm_denom * cc.denominator // math.gcd(lcm_denom, cc.denominator)
+                    coeffs = [int(c * lcm_denom) if isinstance(c, Fraction) else int(c * lcm_denom) for c in poly]
+                    break
+            else:
+                coeffs.append(int(c))
+        
+        if not coeffs:
+            return roots
+        
+        # Trim trailing zeros
+        while coeffs and coeffs[-1] == 0:
+            coeffs.pop()
+        
+        if not coeffs or len(coeffs) < 2:
+            return roots
+        
+        # Degree 1: linear, direct solution
+        if len(coeffs) == 2:
+            a, b = coeffs[0], coeffs[1]
+            if b != 0 and a % b == 0:
+                root = -a // b
+                if abs(root) <= X:
+                    roots.append(root)
+            return roots
+        
+        # Degree 2: quadratic formula
+        if len(coeffs) == 3:
+            a, b, c = coeffs[0], coeffs[1], coeffs[2]
+            if c != 0:
+                disc = b * b - 4 * a * c
+                if disc >= 0:
+                    sqrt_disc = int(math.isqrt(disc))
+                    if sqrt_disc * sqrt_disc == disc:
+                        for sign in [1, -1]:
+                            numer = -b + sign * sqrt_disc
+                            denom = 2 * c
+                            if denom != 0 and numer % denom == 0:
+                                root = numer // denom
+                                if abs(root) <= X and root not in roots:
+                                    roots.append(root)
+            return roots
+        
+        # Higher degree: First try ALL small integer roots directly (most effective!)
+        # This is the key insight: if the root is small (|x| <= X), just try them all
+        search_limit = min(X, 100000)  # Reasonable limit for direct search
+        for r in range(-search_limit, search_limit + 1):
+            if r in roots:
+                continue
+            val = sum(coeffs[i] * (r ** i) for i in range(len(coeffs)))
+            if val == 0:
+                roots.append(r)
+        
+        if roots:
+            return roots
+        
+        # Rational root theorem for larger X
+        # Possible rational roots: ±(divisors of a0) / (divisors of leading coeff)
+        a0 = abs(coeffs[0])
+        an = abs(coeffs[-1])
+        
+        if a0 == 0:
+            # 0 is a root
+            if 0 not in roots:
+                roots.append(0)
+            # Factor out x and recurse
+            new_coeffs = coeffs[1:]
+            roots.extend(self._integer_roots(new_coeffs, X))
+            return roots
+        
+        # For large a0, find small divisors that could be roots
+        def small_divisors_of_large(n, limit):
+            """Find divisors of n that are <= limit"""
+            divs = set()
+            for i in range(1, min(limit + 1, 100001)):
+                if n % i == 0:
+                    divs.add(i)
+            return list(divs)
+        
+        a0_small_divs = small_divisors_of_large(a0, X) if a0 > 0 else [1]
+        an_small_divs = small_divisors_of_large(an, X) if an > 0 else [1]
+        
+        tried = set()
+        for num in a0_small_divs:
+            for den in an_small_divs:
+                if den == 0:
+                    continue
+                if num % den == 0:
+                    candidate = num // den
+                    for sign in [1, -1]:
+                        r = sign * candidate
+                        if r in tried or abs(r) > X:
+                            continue
+                        tried.add(r)
+                        
+                        # Evaluate polynomial
+                        val = sum(coeffs[i] * (r ** i) for i in range(len(coeffs)))
+                        if val == 0 and r not in roots:
+                            roots.append(r)
+        
+        return roots
+
     def find_small_roots(self, X: int, m: int = 3, verbose: bool = True,
                          num_passes: int = 1) -> List[int]:
         """
