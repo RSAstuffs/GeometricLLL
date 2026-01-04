@@ -10,7 +10,7 @@ factoring N = p*q is represented as transformations on a square:
 3. Compress C and D (creating line)
 4. Compress line into point (factoring result)
 
-Author: AI Assistant
+Author: AI Assistant!!
 """
 
 import numpy as np
@@ -51,6 +51,31 @@ class GeometricLLL:
         else:
             self.use_mpmath = False
 
+    def _calculate_mu_round(self, num, den):
+        """Calculate round(num/den) safely for large integers"""
+        if den == 0: return 0
+        
+        if self.use_mpmath and MPMATH_AVAILABLE:
+            # Use mpmath for high precision division
+            try:
+                return int(mp.nint(mpf(num) / mpf(den)))
+            except:
+                # Fallback if mpmath fails
+                pass
+                
+        # Integer arithmetic fallback
+        # round(n/d) = (2*n + d) // (2*d) for positive d
+        # Handle signs
+        sign = 1
+        if (num > 0 and den < 0) or (num < 0 and den > 0):
+            sign = -1
+        
+        num_abs = abs(num)
+        den_abs = abs(den)
+        
+        q = (2 * num_abs + den_abs) // (2 * den_abs)
+        return sign * q
+
     def solve_to_front(self) -> Optional[Tuple[int, int]]:
         """Bridge method for serious_coppersmith_assault.py"""
         p, q = self.find_factors_geometrically()
@@ -61,151 +86,154 @@ class GeometricLLL:
     def step1_fuse_ab(self, fusion_ratio: float = 1.0) -> np.ndarray:
         """
         Step 1: Fuse vertices A and B together.
-        This represents the first geometric transformation in the LLL algorithm.
-        Uses arbitrary precision when needed for large numbers.
+        
+        Mathematically: This performs a Gauss-Lagrange reduction (2D LLL) on the first two vectors.
+        This aligns them and finds the shortest vector in their plane, effectively "fusing" them
+        into a minimal basis.
         
         Args:
-            fusion_ratio: How much to fuse (0.0 = no fusion, 1.0 = complete fusion)
+            fusion_ratio: Unused in valid lattice reduction, kept for API compatibility.
             
         Returns:
-            Updated vertices array with A and B fused
+            Updated vertices array with A and B reduced (fused)
         """
         if self.vertices is None:
-            # Initialize default square if vertices not set
-            self.vertices = np.array([
-                [0.0, 0.0],      # A
-                [10.0, 0.0],     # B
-                [10.0, 10.0],    # C
-                [0.0, 10.0]      # D
-            ], dtype=np.float64)
+            return np.zeros((4, 2))
+            
+        # Work with a copy
+        vertices = self.vertices.copy()
         
-        # Use mpmath for large numbers to avoid precision loss
-        if self.use_mpmath and MPMATH_AVAILABLE:
-            # Convert to mpmath matrix for arbitrary precision
-            vertices_mp = mpmatrix(self.vertices.tolist())
+        # We treat vertices[0] as A and vertices[1] as B
+        # These are vectors in D-dimensional space (D = vertices.shape[1])
+        
+        # Perform Gauss Reduction on A and B
+        # This is the 2D equivalent of LLL
+        
+        # Convert to object/int for exact arithmetic if possible, or float
+        # Assuming vertices are float for now, but we want integer operations
+        
+        v1 = vertices[0]
+        v2 = vertices[1]
+        
+        # Simple Gauss reduction loop
+        # v2 = v2 - round( <v2,v1>/<v1,v1> ) * v1
+        # swap if |v2| < |v1|
+        
+        max_iter = 10
+        for _ in range(max_iter):
+            norm1 = np.dot(v1, v1)
+            if norm1 == 0: break # Avoid division by zero
             
-            # Fuse A and B using mpmath arithmetic
-            midpoint_ab = (vertices_mp[0, :] + vertices_mp[1, :]) / mpf(2.0)
-            fusion_ratio_mp = mpf(fusion_ratio)
-            one_minus_ratio = mpf(1.0) - fusion_ratio_mp
+            # Calculate mu = <v2,v1>/<v1,v1> safely
+            num = np.dot(v2, v1)
+            q = self._calculate_mu_round(num, norm1)
             
-            # Interpolate using mpmath
-            vertices_mp[0, :] = vertices_mp[0, :] * one_minus_ratio + midpoint_ab * fusion_ratio_mp
-            vertices_mp[1, :] = vertices_mp[1, :] * one_minus_ratio + midpoint_ab * fusion_ratio_mp
+            if q != 0:
+                v2 = v2 - q * v1
+                
+            norm2 = np.dot(v2, v2)
             
-            # Convert back to numpy array
-            vertices = np.array([[float(vertices_mp[i, j]) for j in range(2)] for i in range(4)], dtype=np.float64)
-        else:
-            # Standard numpy operations for smaller numbers
-            vertices = self.vertices.copy().astype(np.float64)
-            
-            # Fuse A and B: move them toward their midpoint
-            midpoint_ab = (vertices[0] + vertices[1]) / 2.0
-            
-            # Interpolate between original positions and midpoint
-            vertices[0] = vertices[0] * (1.0 - fusion_ratio) + midpoint_ab * fusion_ratio
-            vertices[1] = vertices[1] * (1.0 - fusion_ratio) + midpoint_ab * fusion_ratio
+            if norm2 < norm1:
+                # Swap
+                v1, v2 = v2, v1
+            else:
+                # Reduced
+                break
+                
+        vertices[0] = v1
+        vertices[1] = v2
         
         return vertices
 
     def step2_compress_cd(self, compression_ratio: float = 1.0) -> np.ndarray:
         """
         Step 2: Compress vertices C and D toward their midpoint.
-        This represents the second geometric transformation.
-        Uses arbitrary precision when needed for large numbers.
+        
+        Mathematically: This performs Size Reduction of C and D against the reduced basis {A, B}.
+        This "compresses" them by removing the components parallel to A and B.
         
         Args:
-            compression_ratio: How much to compress (0.0 = no compression, 1.0 = complete)
+            compression_ratio: Unused, kept for API compatibility.
             
         Returns:
-            Updated vertices array with C and D compressed
+            Updated vertices array with C and D compressed (size reduced)
         """
         if self.vertices is None:
-            self.vertices = np.array([
-                [0.0, 0.0],      # A
-                [10.0, 0.0],    # B
-                [10.0, 10.0],   # C
-                [0.0, 10.0]     # D
-            ], dtype=np.float64)
+            return np.zeros((4, 2))
+            
+        # First ensure A and B are fused (reduced)
+        vertices = self.step1_fuse_ab()
         
-        # First ensure A and B are fused (call step1 if needed)
-        if compression_ratio > 0:
-            vertices = self.step1_fuse_ab(1.0)
-        else:
-            vertices = self.vertices.copy().astype(np.float64)
+        v1 = vertices[0]
+        v2 = vertices[1]
+        v3 = vertices[2]
+        v4 = vertices[3]
         
-        # Use mpmath for large numbers
-        if self.use_mpmath and MPMATH_AVAILABLE:
-            vertices_mp = mpmatrix(vertices.tolist())
+        # Reduce v3 (C) against v2 then v1
+        # v3 = v3 - round(mu_32)*v2 - round(mu_31)*v1
+        
+        # Against v2
+        norm2 = np.dot(v2, v2)
+        if norm2 != 0:
+            num32 = np.dot(v3, v2)
+            q32 = self._calculate_mu_round(num32, norm2)
+            v3 = v3 - q32 * v2
             
-            # Compress C and D using mpmath arithmetic
-            midpoint_cd = (vertices_mp[2, :] + vertices_mp[3, :]) / mpf(2.0)
-            comp_ratio_mp = mpf(compression_ratio)
-            one_minus_ratio = mpf(1.0) - comp_ratio_mp
+        # Against v1
+        norm1 = np.dot(v1, v1)
+        if norm1 != 0:
+            num31 = np.dot(v3, v1)
+            q31 = self._calculate_mu_round(num31, norm1)
+            v3 = v3 - q31 * v1
             
-            vertices_mp[2, :] = vertices_mp[2, :] * one_minus_ratio + midpoint_cd * comp_ratio_mp
-            vertices_mp[3, :] = vertices_mp[3, :] * one_minus_ratio + midpoint_cd * comp_ratio_mp
+        # Reduce v4 (D) against v2 then v1
+        # Against v2
+        if norm2 != 0:
+            num42 = np.dot(v4, v2)
+            q42 = self._calculate_mu_round(num42, norm2)
+            v4 = v4 - q42 * v2
             
-            # Convert back to numpy
-            vertices = np.array([[float(vertices_mp[i, j]) for j in range(2)] for i in range(4)], dtype=np.float64)
-        else:
-            # Standard numpy operations
-            # Compress C and D toward their midpoint
-            midpoint_cd = (vertices[2] + vertices[3]) / 2.0
+        # Against v1
+        if norm1 != 0:
+            num41 = np.dot(v4, v1)
+            q41 = self._calculate_mu_round(num41, norm1)
+            v4 = v4 - q41 * v1
             
-            # Interpolate between original positions and midpoint
-            vertices[2] = vertices[2] * (1.0 - compression_ratio) + midpoint_cd * compression_ratio
-            vertices[3] = vertices[3] * (1.0 - compression_ratio) + midpoint_cd * compression_ratio
+        vertices[2] = v3
+        vertices[3] = v4
         
         return vertices
 
     def step3_compress_to_point(self, final_ratio: float = 1.0) -> np.ndarray:
         """
         Step 3: Compress the entire shape into a single point.
-        This represents the final geometric transformation.
-        Uses arbitrary precision when needed for large numbers.
+        
+        Mathematically: This performs a final check or reduction on the remaining vectors.
+        In the context of LLL, this ensures the entire basis is size-reduced.
         
         Args:
-            final_ratio: How much to compress (0.0 = no compression, 1.0 = complete to point)
+            final_ratio: Unused.
             
         Returns:
-            Updated vertices array compressed toward center point
+            Updated vertices array fully reduced.
         """
-        if self.vertices is None:
-            self.vertices = np.array([
-                [0.0, 0.0],      # A
-                [10.0, 0.0],    # B
-                [10.0, 10.0],   # C
-                [0.0, 10.0]     # D
-            ], dtype=np.float64)
+        # Apply steps 1 and 2 first
+        vertices = self.step2_compress_cd()
         
-        # First apply steps 1 and 2
-        vertices = self.step1_fuse_ab(1.0)
-        vertices = self.step2_compress_cd(1.0)
+        # Just return the result of step 2 as it includes the full reduction logic for 4 vectors
+        # relative to the first two.
+        # Ideally we would reduce v4 against v3 as well.
         
-        # Use mpmath for large numbers
-        if self.use_mpmath and MPMATH_AVAILABLE:
-            vertices_mp = mpmatrix(vertices.tolist())
+        v3 = vertices[2]
+        v4 = vertices[3]
+        
+        norm3 = np.dot(v3, v3)
+        if norm3 != 0:
+            num43 = np.dot(v4, v3)
+            q43 = self._calculate_mu_round(num43, norm3)
+            v4 = v4 - q43 * v3
             
-            # Calculate center point using mpmath
-            center_mp = (vertices_mp[0, :] + vertices_mp[1, :] + vertices_mp[2, :] + vertices_mp[3, :]) / mpf(4.0)
-            final_ratio_mp = mpf(final_ratio)
-            one_minus_ratio = mpf(1.0) - final_ratio_mp
-            
-            # Compress all vertices toward center
-            for i in range(4):
-                vertices_mp[i, :] = vertices_mp[i, :] * one_minus_ratio + center_mp * final_ratio_mp
-            
-            # Convert back to numpy
-            vertices = np.array([[float(vertices_mp[i, j]) for j in range(2)] for i in range(4)], dtype=np.float64)
-        else:
-            # Standard numpy operations
-            # Calculate center point (centroid of all vertices)
-            center = np.mean(vertices, axis=0)
-            
-            # Compress all vertices toward center
-            for i in range(len(vertices)):
-                vertices[i] = vertices[i] * (1.0 - final_ratio) + center * final_ratio
+        vertices[3] = v4
         
         return vertices
 
