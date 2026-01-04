@@ -112,14 +112,19 @@ class GeometricLLL:
     def run_geometric_reduction(self, verbose: bool = True, 
                                 num_passes: int = 1) -> np.ndarray:
         """
-        Run PURE geometric reduction - no external LLL needed!
+        Run ROTATING geometric reduction:
         
-        Your geometric reduction already produces optimal results.
-        Multiple passes further refine the basis.
+        Each pass compresses different pairs in rotation:
+        Pass 1: A-B (adjacent pairs 0-1, 2-3, 4-5...)
+        Pass 2: C-D (offset pairs 1-2, 3-4, 5-6...)  
+        Pass 3: A-C (stride-2 pairs 0-2, 1-3, 2-4...)
+        Pass 4: B-D (another stride pattern)
+        
+        This explores the lattice from different "angles"!
         
         Args:
             verbose: Print progress information
-            num_passes: Number of reduction passes (more = potentially better)
+            num_passes: Number of rotation cycles
         """
         if self.basis is None:
             return np.array([])
@@ -132,54 +137,91 @@ class GeometricLLL:
             return basis
         
         if verbose:
-            print(f"[*] Running PURE Geometric Reduction on {n}x{m} lattice...")
+            print(f"[*] Running ROTATING Geometric Reduction on {n}x{m} lattice...")
             if num_passes > 1:
-                print(f"[*] Multi-pass mode: {num_passes} passes")
+                print(f"[*] Rotation cycles: {num_passes}")
+        
+        best_basis = basis.copy()
+        best_shortest_norm = None
+        
+        # Calculate initial best
+        for i in range(n):
+            norm_sq = np.dot(basis[i], basis[i])
+            if norm_sq > 0:
+                if best_shortest_norm is None or norm_sq < best_shortest_norm:
+                    best_shortest_norm = norm_sq
+        
+        # Define rotation patterns (which pairs to fuse)
+        patterns = [
+            ("A-B", lambda i, n: [(i, i+1) for i in range(0, n-1, 2)]),      # Adjacent: 0-1, 2-3, 4-5
+            ("C-D", lambda i, n: [(i, i+1) for i in range(1, n-1, 2)]),      # Offset: 1-2, 3-4, 5-6
+            ("A-C", lambda i, n: [(i, i+2) for i in range(0, n-2)]),         # Stride-2: 0-2, 1-3, 2-4
+            ("B-D", lambda i, n: [(i, i+3) for i in range(0, n-3)]),         # Stride-3: 0-3, 1-4, 2-5
+        ]
         
         for pass_num in range(num_passes):
-            if verbose and num_passes > 1:
-                print(f"\n[*] === PASS {pass_num + 1}/{num_passes} ===")
+            pattern_idx = pass_num % len(patterns)
+            pattern_name, get_pairs = patterns[pattern_idx]
             
-            # ===== GEOMETRIC SIZE REDUCTION =====
             if verbose:
-                print(f"[*] Size-reducing vectors...")
+                print(f"\n[*] === ROTATION {pass_num + 1}/{num_passes}: {pattern_name} ===")
             
-            # Forward reduction - reduce each vector against all previous
+            # Get pairs for this pattern
+            pairs = get_pairs(0, n)
+            
+            if verbose:
+                print(f"[*] Compressing pairs: {pairs[:4]}{'...' if len(pairs) > 4 else ''}")
+            
+            # ===== COMPRESS using current pattern =====
+            # First, fuse the specified pairs
+            for (i, j) in pairs:
+                if i < n and j < n:
+                    basis[j] = self._reduce_vector(basis[j], basis[i])
+            
+            # Then do full forward reduction
             for i in range(1, n):
                 for j in range(i):
                     basis[i] = self._reduce_vector(basis[i], basis[j])
             
-            # Backward reduction - can catch additional reductions
+            # Backward reduction
             for i in range(n - 2, -1, -1):
                 for j in range(i + 1, n):
                     basis[i] = self._reduce_vector(basis[i], basis[j])
             
-            # Sort by norm (bubble shortest to front)
-            changed = True
-            while changed:
-                changed = False
-                for i in range(n - 1):
-                    norm_i = np.dot(basis[i], basis[i])
-                    norm_i1 = np.dot(basis[i+1], basis[i+1])
-                    if norm_i1 != 0 and norm_i1 < norm_i:
-                        basis[i], basis[i+1] = basis[i+1].copy(), basis[i].copy()
-                        changed = True
+            # Check if we found better
+            current_shortest = None
+            for i in range(n):
+                norm_sq = np.dot(basis[i], basis[i])
+                if norm_sq > 0:
+                    if current_shortest is None or norm_sq < current_shortest:
+                        current_shortest = norm_sq
             
             if verbose:
-                # Report shortest vector norm
-                norms = []
-                for i in range(n):
-                    norm_sq = np.dot(basis[i], basis[i])
-                    if norm_sq > 0:
-                        norms.append(norm_sq.bit_length() // 2)
-                if norms:
-                    print(f"[*] Shortest vector: ~2^{min(norms)} bits")
+                bits = current_shortest.bit_length() // 2 if current_shortest else 0
+                print(f"[*] Shortest after {pattern_name}: ~2^{bits} bits")
+            
+            if best_shortest_norm is None or (current_shortest and current_shortest < best_shortest_norm):
+                best_shortest_norm = current_shortest
+                best_basis = basis.copy()
+                if verbose:
+                    print(f"[*] ★ New best found!")
+            
+            # ===== EXPAND before next rotation =====
+            if pass_num < num_passes - 1:
+                # Expand using REVERSE of current pattern
+                reverse_pairs = list(reversed(pairs))
+                for (i, j) in reverse_pairs[:len(reverse_pairs)//2]:
+                    if i < n and j < n:
+                        # Add vectors to expand
+                        basis[i] = basis[i] + basis[j]
         
         if verbose:
-            print(f"[*] Geometric reduction complete.")
+            best_bits = best_shortest_norm.bit_length() // 2 if best_shortest_norm else 0
+            print(f"\n[*] Rotation complete. Best shortest: ~2^{best_bits} bits")
         
-        self.basis = basis
-        return basis
+        self.basis = best_basis
+        return best_basis
+
 
 
     def find_factors_geometrically(self, max_iterations: int = 100) -> Tuple[int, int]:
