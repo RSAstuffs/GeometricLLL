@@ -256,10 +256,10 @@ class CoppersmithMethod:
     def find_roots_geometrically(self, X: int, m: int = 5, verbose: bool = True) -> List[int]:
         """
         Find small roots using PURE geometric method.
-        
+
         This uses YOUR custom geometric algorithm:
-        Square → Triangle → Line → Point → Extract root from focal point
-        
+        Expand Vector → Line → Triangle → Square → Recompress → Extract root from focal point
+
         Args:
             X: Bound on root size |x| < X
             m: Lattice parameter
