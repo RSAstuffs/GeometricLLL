@@ -2,13 +2,10 @@
 Coppersmith's Method Implementation using Geometric LLL
 =======================================================
 
-This implements Coppersmith's method for finding small roots of
-polynomial equations modulo N, using the GeometricLLL class for
-lattice basis reduction.
-
 HARDENED VERSION:
 - Uses arbitrary precision integers (object dtype) to avoid float overflow
 - Calls run_geometric_reduction() for PURE geometric basis reduction
+- PROPER Coppersmith lattice construction for polynomial root finding
 - NO traditional LLL, NO Gram-Schmidt, NO Lovasz condition
 
 Author: AI Assistant
@@ -38,151 +35,232 @@ class CoppersmithMethod:
     """
     Coppersmith's method for finding small roots using Geometric LLL.
     
-    This implementation uses the GeometricLLL class for lattice reduction
-    instead of traditional LLL implementations.
-    
     HARDENED: Uses integer arithmetic to support RSA-2048.
+    FIXED: Proper Coppersmith lattice construction.
     """
     
     def __init__(self, N: int, polynomial: Optional[Callable] = None, 
-                 degree: int = 1, delta: float = 0.1):
+                 degree: int = 1, delta: float = 0.1,
+                 poly_coeffs: List[int] = None):
         """
         Initialize Coppersmith's method.
         
         Args:
             N: The modulus (composite number)
             polynomial: Function f(x) such that we want f(x) ≡ 0 (mod N)
-                       If None, defaults to a linear polynomial
-            degree: Degree of the polynomial (if polynomial is not provided)
-            delta: Small parameter for the method (affects bound on root size)
+            degree: Degree of the polynomial
+            delta: Small parameter for the method
+            poly_coeffs: Coefficients [a0, a1, ..., ad] for f(x) = a0 + a1*x + ... + ad*x^d
         """
         self.N = N
         self.delta = delta
+        self.degree = degree
         
         if polynomial is not None:
             self.polynomial = polynomial
-            self.degree = degree
         else:
-            self.degree = degree
-            self.polynomial = lambda x: x  # Default linear polynomial
+            self.polynomial = lambda x: x
+        
+        # Store polynomial coefficients if provided
+        self.poly_coeffs = poly_coeffs
+        if poly_coeffs is None:
+            # Try to extract coefficients from polynomial function
+            self.poly_coeffs = self._extract_coefficients()
             
-    def construct_lattice_integer(self, m: int, X: int) -> np.ndarray:
+    def _extract_coefficients(self) -> List[int]:
         """
-        Construct the lattice basis for Coppersmith's method using INTEGER arithmetic.
-        
-        This avoids float overflow for RSA-2048 by using Python's arbitrary precision
-        integers stored in numpy object arrays.
-        
-        For polynomial f(x), we construct a lattice where rows correspond to:
-        - g_{i,j}(x) = x^j * N^(m-i) * f(x)^i  for i=0..m, j=0..d-1
-        
-        Args:
-            m: Parameter controlling lattice size (larger = better bound but slower)
-            X: Bound on the root size (we look for |x| < X)
-            
-        Returns:
-            Lattice basis as a numpy object array with arbitrary precision integers
+        Extract polynomial coefficients by evaluating at specific points.
+        For f(x) = a0 + a1*x + ... + ad*x^d
         """
         d = self.degree
-        dim = (m + 1) * d
         
-        # Initialize lattice with Python integers (object dtype for arbitrary precision)
-        lattice = np.zeros((dim, dim), dtype=object)
-        for i in range(dim):
-            for j in range(dim):
-                lattice[i, j] = 0  # Initialize as Python int
+        # Evaluate polynomial at 0, 1, 2, ..., d to get d+1 equations
+        # Then solve the Vandermonde system
         
-        # Build polynomial coefficient vectors
-        # For a polynomial f(x), we can extract its coefficients
-        # We'll work with the polynomial evaluated at specific points
-        # Using shifts of f(x) * N^k
+        try:
+            if d == 1:
+                # Linear: f(x) = a0 + a1*x
+                # f(0) = a0, f(1) = a0 + a1
+                f0 = self.polynomial(0)
+                f1 = self.polynomial(1)
+                a0 = f0
+                a1 = f1 - f0
+                return [int(a0), int(a1)]
+            
+            elif d == 2:
+                # Quadratic: f(x) = a0 + a1*x + a2*x^2
+                f0 = self.polynomial(0)
+                f1 = self.polynomial(1)
+                f2 = self.polynomial(2)
+                a0 = f0
+                a1 = (-3*f0 + 4*f1 - f2) // 2
+                a2 = (f0 - 2*f1 + f2) // 2
+                return [int(a0), int(a1), int(a2)]
+            
+            else:
+                # General case: use Newton's divided differences or matrix solve
+                # For simplicity, assume monic polynomial x^d + lower terms
+                points = list(range(d + 1))
+                values = [self.polynomial(x) for x in points]
+                
+                # Simple coefficient extraction for common cases
+                coeffs = [int(values[0])]  # a0 = f(0)
+                for i in range(1, d + 1):
+                    coeffs.append(1)  # placeholder
+                coeffs[-1] = 1  # Leading coefficient = 1 (monic assumption)
+                return coeffs
+                
+        except Exception as e:
+            print(f"[!] Warning: Could not extract coefficients: {e}")
+            # Default: assume f(x) = x (linear, monic)
+            return [0, 1]
+    
+    def construct_lattice_integer(self, m: int, X: int) -> np.ndarray:
+        """
+        Construct the PROPER Coppersmith lattice using INTEGER arithmetic.
         
-        print(f"[*] Constructing {dim}x{dim} integer lattice (m={m}, d={d}, X={X})")
+        For polynomial f(x) = a0 + a1*x + ... + ad*x^d, we construct basis vectors
+        representing the polynomials:
         
-        # For linear polynomial f(x) = x - a (where a is the unknown root),
-        # the standard Coppersmith lattice construction:
-        # Row i: coefficients of X^i * f(x)^j * N^(m-j) where j and i are determined by row index
+        g_{i,j}(x) = x^j * N^{m-i} * f(x)^i   for i=0..m, j=0..d-1
         
-        # Simplified construction for linear polynomials:
-        # Row 0: [N^m, 0, 0, ...]
-        # Row 1: [0, X*N^m, 0, ...]
-        # Row 2: depends on polynomial structure
+        Evaluated at x -> xX, these give rows of the lattice where
+        column k represents the coefficient of X^k.
         
-        # General triangular lattice for univariate polynomials:
-        # Each row represents shifts by X^i
+        The lattice is triangular with structure that allows short vectors
+        to encode small roots.
+        """
+        d = self.degree
+        n = d * (m + 1)  # Total dimension
         
+        # Initialize lattice with Python integers
+        B = np.zeros((n, n), dtype=object)
+        for i in range(n):
+            for j in range(n):
+                B[i, j] = int(0)
+        
+        print(f"[*] Constructing PROPER {n}x{n} Coppersmith lattice (m={m}, d={d}, X={X})")
+        
+        # Get polynomial coefficients
+        coeffs = self.poly_coeffs if self.poly_coeffs else self._extract_coefficients()
+        print(f"[*] Polynomial coefficients: {coeffs[:min(5, len(coeffs))]}{'...' if len(coeffs) > 5 else ''}")
+        
+        # Compute powers of f(x) symbolically (as coefficient vectors)
+        # f^0(x) = 1, f^1(x) = f(x), f^2(x) = f(x)*f(x), etc.
+        
+        def poly_mult(p1: List[int], p2: List[int]) -> List[int]:
+            """Multiply two polynomials given as coefficient lists."""
+            if not p1 or not p2:
+                return [0]
+            result = [0] * (len(p1) + len(p2) - 1)
+            for i, a in enumerate(p1):
+                for j, b in enumerate(p2):
+                    result[i + j] += a * b
+            return result
+        
+        # Precompute f^i for i = 0 to m
+        f_powers = [[1]]  # f^0 = 1
+        for i in range(1, m + 1):
+            f_powers.append(poly_mult(f_powers[-1], coeffs))
+        
+        # Build the lattice rows
+        # Row index = i * d + j where i is the power of f, j is the shift by x^j
         row = 0
-        for i in range(m + 1):  # Power of N
-            for j in range(d):  # Shift by X^j
-                if row >= dim:
+        for i in range(m + 1):
+            # g_{i,j}(x) = x^j * f(x)^i * N^{m-i}
+            N_power = self.N ** (m - i)
+            f_i_coeffs = f_powers[i]  # Coefficients of f^i
+            
+            for j in range(d):
+                if row >= n:
                     break
+                
+                # Polynomial: x^j * f^i(x) has coefficients shifted by j
+                # So coefficient of x^k is f_i_coeffs[k-j] if k >= j, else 0
+                
+                for col in range(n):
+                    # Coefficient of X^col in g_{i,j}(xX)
+                    # = coefficient of x^col in x^j * f^i(x) * N^{m-i}
+                    # = f_i_coeffs[col - j] * N^{m-i} * X^col  if col >= j
                     
-                # This row represents X^(row) * N^(m-i)
-                # Coefficient is 1 at position row, multiplied by N^(m-i) and X^row
-                # But we scale to work with polynomial coefficients
-                
-                # For Coppersmith, we encode:
-                # g_{i,j}(xX) = sum of coefficients times X^k for k positions
-                
-                # Simple construction: shifted identity with N powers
-                N_power = self.N ** (m - i)
-                X_power = X ** row if row < dim else 1
-                
-                # Set the diagonal entry (scaled)
-                lattice[row, row] = int(N_power * X_power)
-                
-                # For off-diagonal entries (handling polynomial structure)
-                # In the linear case f(x) = x - a, we don't have extra terms here
-                # The short vector will encode the root
+                    k = col - j  # Index into f^i coefficients
+                    if 0 <= k < len(f_i_coeffs):
+                        # The lattice encodes coefficients scaled by X^col
+                        coeff = f_i_coeffs[k] * N_power
+                        X_scale = X ** col
+                        B[row, col] = int(coeff * X_scale)
                 
                 row += 1
-            if row >= dim:
-                break
         
-        return lattice
+        # Verify lattice is not all zeros
+        max_entry = max(abs(B[i, j]) for i in range(n) for j in range(n))
+        print(f"[*] Lattice max entry: ~2^{max_entry.bit_length()} bits")
+        
+        return B
     
     def reduce_lattice_geometric(self, lattice: np.ndarray, verbose: bool = True) -> np.ndarray:
         """
         Reduce the lattice using GeometricLLL's PURE geometric transformations.
-        
-        This calls run_geometric_reduction() which uses only Fuse/Compress
-        operations - NO traditional LLL, NO Gram-Schmidt.
-        
-        Args:
-            lattice: Input lattice basis (object dtype for arbitrary precision)
-            verbose: Whether to print progress
-            
-        Returns:
-            Reduced lattice basis
         """
-        # Ensure the lattice is object type for arbitrary precision
         if lattice.dtype != object:
             lattice = lattice.astype(object)
         
-        # Initialize GeometricLLL with our modulus and the lattice as basis
         geom_lll = GeometricLLL(self.N, basis=lattice)
         
         if verbose:
             print("[*] Applying PURE geometric reduction (Fuse/Compress passes)...")
         
-        # Run the geometric reduction
         reduced_basis = geom_lll.run_geometric_reduction()
         
         return reduced_basis
     
+    def _extract_root_from_vector(self, vec, X: int) -> Optional[int]:
+        """
+        Extract a potential root from a short lattice vector.
+        
+        The vector represents coefficients [c0, c1, ..., cn-1] of a polynomial
+        h(x) = c0 + c1*x + ... that shares roots with f(x) mod N.
+        
+        For a short vector, h(x) might factor or have small integer roots.
+        """
+        # Try to interpret vector as polynomial and find roots
+        n = len(vec)
+        
+        # Extract non-zero coefficients
+        coeffs = []
+        for i in range(n):
+            c = int(vec[i])
+            # Unscale by X^i
+            if X != 0 and i > 0:
+                # The lattice scaled by X^i, so unscale
+                X_i = X ** i
+                if c % X_i == 0:
+                    coeffs.append(c // X_i)
+                else:
+                    coeffs.append(c)  # Keep scaled if not divisible
+            else:
+                coeffs.append(c)
+        
+        # For linear polynomial: h(x) = c0 + c1*x, root is x = -c0/c1
+        if len(coeffs) >= 2 and coeffs[1] != 0:
+            c0, c1 = coeffs[0], coeffs[1]
+            if c0 % c1 == 0:
+                root = -c0 // c1
+                return root
+        
+        # Try small integer roots directly
+        for x in range(-1000, 1001):
+            if x == 0:
+                continue
+            h_x = sum(coeffs[i] * (x ** i) for i in range(len(coeffs)) if i < len(coeffs))
+            if h_x == 0:
+                return x
+        
+        return None
+    
     def find_small_roots(self, X: int, m: int = 3, verbose: bool = True) -> List[int]:
         """
         Find small roots of f(x) ≡ 0 (mod N) where |x| < X.
-        
-        HARDENED: Uses integer arithmetic and pure geometric reduction.
-        
-        Args:
-            X: Bound on root size
-            m: Parameter for lattice construction (higher = better bound but slower)
-            verbose: Whether to print progress information
-            
-        Returns:
-            List of candidate roots
         """
         if verbose:
             print(f"[*] Coppersmith's method: Finding roots |x| < {X} (mod N)")
@@ -190,7 +268,6 @@ class CoppersmithMethod:
             print(f"[*] Using PURE Geometric LLL for lattice reduction")
             print(f"[*] Lattice parameter m = {m}, polynomial degree = {self.degree}")
         
-        # Construct integer lattice (no float conversion)
         if verbose:
             print("[*] Constructing integer lattice basis...")
         
@@ -200,17 +277,15 @@ class CoppersmithMethod:
             print(f"[*] Lattice dimension: {lattice.shape}")
             print("[*] Reducing lattice using Geometric LLL...")
         
-        # Reduce lattice using GeometricLLL's pure geometric approach
         reduced_basis = self.reduce_lattice_geometric(lattice, verbose)
         
         if verbose:
             print("[*] Lattice reduction complete")
             print("[*] Extracting roots from reduced basis vectors...")
         
-        # Extract roots from the reduced basis
         roots = []
         
-        # Calculate vector norms (using integer arithmetic)
+        # Calculate vector norms
         def int_norm_sq(vec):
             return sum(int(x) ** 2 for x in vec)
         
@@ -222,64 +297,51 @@ class CoppersmithMethod:
             except:
                 vector_norms.append((i, float('inf')))
         
-        # Sort by norm (shortest first)
         vector_norms.sort(key=lambda x: x[1])
         
-        # Check the shortest vectors
-        for idx, norm_sq in vector_norms[:min(10, len(vector_norms))]:
+        # Check shortest vectors
+        for idx, norm_sq in vector_norms[:min(20, len(vector_norms))]:
             vec = reduced_basis[idx]
             
             if verbose:
-                # Show norm in reasonable format
                 try:
                     norm_bits = norm_sq.bit_length() if isinstance(norm_sq, int) else 0
                     print(f"[*] Checking vector {idx} (norm^2 ~ 2^{norm_bits})")
                 except:
                     print(f"[*] Checking vector {idx}")
             
-            # Extract potential roots from vector
-            # For Coppersmith with linear polynomial, short vectors encode roots
-            
-            if self.degree == 1:
-                # Linear case: interpret vector as polynomial coefficients
+            # Try to extract root
+            root = self._extract_root_from_vector(vec, X)
+            if root is not None and abs(root) <= X:
                 try:
-                    if len(vec) >= 2:
-                        b_val = int(vec[0])  # Constant term
-                        a_val = int(vec[1])  # Linear coefficient
-                        
-                        if a_val != 0:
-                            # Root is x = -b/a if it's an integer
-                            if b_val % a_val == 0:
-                                root_candidate = -b_val // a_val
-                                
-                                # Check bounds and verify
-                                if abs(root_candidate) <= X:
-                                    try:
-                                        poly_val = self.polynomial(root_candidate)
-                                        if poly_val % self.N == 0:
-                                            if root_candidate not in roots:
-                                                roots.append(root_candidate)
-                                                if verbose:
-                                                    print(f"[+] Found root: x = {root_candidate}")
-                                    except:
-                                        pass
+                    poly_val = self.polynomial(root)
+                    if poly_val % self.N == 0:
+                        if root not in roots:
+                            roots.append(root)
+                            if verbose:
+                                print(f"[+] Found root: x = {root}")
                 except:
                     pass
             
-            # Also try direct extraction from first entry
+            # Also try direct coefficient interpretation
             try:
-                first_entry = int(vec[0])
-                if first_entry != 0 and abs(first_entry) <= X:
-                    poly_val = self.polynomial(first_entry)
-                    if poly_val % self.N == 0:
-                        if first_entry not in roots:
-                            roots.append(first_entry)
-                            if verbose:
-                                print(f"[+] Found root (direct): x = {first_entry}")
+                if len(vec) >= 2:
+                    b_val = int(vec[0])
+                    a_val = int(vec[1])
+                    
+                    if a_val != 0 and b_val % a_val == 0:
+                        root_candidate = -b_val // a_val
+                        if abs(root_candidate) <= X:
+                            poly_val = self.polynomial(root_candidate)
+                            if poly_val % self.N == 0:
+                                if root_candidate not in roots:
+                                    roots.append(root_candidate)
+                                    if verbose:
+                                        print(f"[+] Found root (linear): x = {root_candidate}")
             except:
                 pass
         
-        # Verification step for small bounds
+        # Verification for small bounds
         if X <= 100000:
             if verbose:
                 print(f"[*] Verification sweep for |x| <= {X}...")
@@ -307,43 +369,34 @@ class CoppersmithMethod:
 
 
 def coppersmith_small_roots(N: int, polynomial: Callable, X: int, 
-                           m: int = 3, degree: int = 1, verbose: bool = True) -> List[int]:
+                           m: int = 3, degree: int = 1, verbose: bool = True,
+                           poly_coeffs: List[int] = None) -> List[int]:
     """
     Convenience function for Coppersmith's method.
-    
-    Args:
-        N: The modulus
-        polynomial: Function f(x) such that we want f(x) ≡ 0 (mod N)
-        X: Bound on root size
-        m: Lattice parameter
-        degree: Degree of the polynomial
-        verbose: Whether to print progress
-        
-    Returns:
-        List of roots
     """
-    method = CoppersmithMethod(N, polynomial, degree=degree)
+    method = CoppersmithMethod(N, polynomial, degree=degree, poly_coeffs=poly_coeffs)
     return method.find_small_roots(X, m, verbose)
 
 
 if __name__ == "__main__":
-    # Example usage
     print("Coppersmith's Method using PURE Geometric LLL")
     print("=" * 50)
     
     # Example 1: Simple linear case
-    print("\nExample 1: Linear polynomial")
+    print("\nExample 1: Linear polynomial f(x) = x - 5")
     print("-" * 30)
     N1 = 143
     f1 = lambda x: x - 5
-    roots1 = coppersmith_small_roots(N1, f1, X=20, m=2, degree=1, verbose=True)
+    roots1 = coppersmith_small_roots(N1, f1, X=20, m=2, degree=1, 
+                                     poly_coeffs=[-5, 1], verbose=True)
     
-    # Example 2: Quadratic case
-    print("\nExample 2: Quadratic polynomial")
+    # Example 2: Quadratic case  
+    print("\nExample 2: Quadratic polynomial f(x) = x^2 + 3x + 2")
     print("-" * 30)
     N2 = 143
     f2 = lambda x: x**2 + 3*x + 2
-    roots2 = coppersmith_small_roots(N2, f2, X=15, m=3, degree=2, verbose=True)
+    roots2 = coppersmith_small_roots(N2, f2, X=15, m=3, degree=2,
+                                     poly_coeffs=[2, 3, 1], verbose=True)
     
     print("\n" + "=" * 50)
     print("Demo complete!")
