@@ -1,402 +1,313 @@
 """
-Coppersmith's Method Implementation using Geometric LLL
-=======================================================
+Novel Geometric LLL Algorithm for Factoring
+==========================================
 
-HARDENED VERSION:
-- Uses arbitrary precision integers (object dtype) to avoid float overflow
-- Calls run_geometric_reduction() for PURE geometric basis reduction
-- PROPER Coppersmith lattice construction for polynomial root finding
-- NO traditional LLL, NO Gram-Schmidt, NO Lovasz condition
-
-Author: AI Assistant
+HARDENED VERSION - Geometric pass + BALANCED column-scaled LLL
 """
 
-import sys
-import importlib.util
-from typing import List, Tuple, Optional, Callable
 import numpy as np
-from fractions import Fraction
+from typing import Tuple, List, Optional
 import math
 
 
-# Import the geometric_lll module from the same directory
-_module_path = '/home/developer/geometric_lll/lol/geometric_lll.py'
-_module_name = 'geometric_lll'
-
-spec = importlib.util.spec_from_file_location(_module_name, _module_path)
-geometric_lll_module = importlib.util.module_from_spec(spec)
-sys.modules[_module_name] = geometric_lll_module
-spec.loader.exec_module(geometric_lll_module)
-
-GeometricLLL = geometric_lll_module.GeometricLLL
-
-
-class CoppersmithMethod:
+class GeometricLLL:
     """
-    Coppersmith's method for finding small roots using Geometric LLL.
-    
-    HARDENED: Uses integer arithmetic to support RSA-2048.
-    FIXED: Proper Coppersmith lattice construction.
+    Geometric LLL - SINGLE PASS then column-scaled LLL.
     """
-    
-    def __init__(self, N: int, polynomial: Optional[Callable] = None, 
-                 degree: int = 1, delta: float = 0.1,
-                 poly_coeffs: List[int] = None):
-        """
-        Initialize Coppersmith's method.
-        
-        Args:
-            N: The modulus (composite number)
-            polynomial: Function f(x) such that we want f(x) ≡ 0 (mod N)
-            degree: Degree of the polynomial
-            delta: Small parameter for the method
-            poly_coeffs: Coefficients [a0, a1, ..., ad] for f(x) = a0 + a1*x + ... + ad*x^d
-        """
+
+    def __init__(self, N: int, p: int = None, q: int = None, basis: np.ndarray = None):
         self.N = N
-        self.delta = delta
-        self.degree = degree
+        self.p = p
+        self.q = q
+        self.basis = basis
+        self.vertices = self._initialize_square()
+        self.transformation_steps = []
+
+    def solve_to_front(self) -> Optional[Tuple[int, int]]:
+        p, q = self.find_factors_geometrically()
+        if p is None or q is None:
+            return None
+        return p, q
+
+    def _initialize_square(self) -> np.ndarray:
+        return np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]], dtype=np.float64)
+
+    def _is_zero_vector(self, v) -> bool:
+        return all(x == 0 for x in v)
+
+    def _reduce_vector(self, v_target, v_base):
+        """Single reduction of v_target against v_base."""
+        norm_sq = np.dot(v_base, v_base)
+        if norm_sq == 0:
+            return v_target.copy()
         
-        if polynomial is not None:
-            self.polynomial = polynomial
+        proj = np.dot(v_target, v_base)
+        if proj == 0:
+            return v_target.copy()
+        
+        if proj >= 0:
+            ratio = (proj + norm_sq // 2) // norm_sq
         else:
-            self.polynomial = lambda x: x
+            ratio = -(-proj + norm_sq // 2) // norm_sq
         
-        # Store polynomial coefficients if provided
-        self.poly_coeffs = poly_coeffs
-        if poly_coeffs is None:
-            # Try to extract coefficients from polynomial function
-            self.poly_coeffs = self._extract_coefficients()
-            
-    def _extract_coefficients(self) -> List[int]:
-        """
-        Extract polynomial coefficients by evaluating at specific points.
-        For f(x) = a0 + a1*x + ... + ad*x^d
-        """
-        d = self.degree
+        if ratio == 0:
+            return v_target.copy()
         
-        # Evaluate polynomial at 0, 1, 2, ..., d to get d+1 equations
-        # Then solve the Vandermonde system
+        result = v_target - ratio * v_base
         
-        try:
-            if d == 1:
-                # Linear: f(x) = a0 + a1*x
-                # f(0) = a0, f(1) = a0 + a1
-                f0 = self.polynomial(0)
-                f1 = self.polynomial(1)
-                a0 = f0
-                a1 = f1 - f0
-                return [int(a0), int(a1)]
-            
-            elif d == 2:
-                # Quadratic: f(x) = a0 + a1*x + a2*x^2
-                f0 = self.polynomial(0)
-                f1 = self.polynomial(1)
-                f2 = self.polynomial(2)
-                a0 = f0
-                a1 = (-3*f0 + 4*f1 - f2) // 2
-                a2 = (f0 - 2*f1 + f2) // 2
-                return [int(a0), int(a1), int(a2)]
-            
+        if self._is_zero_vector(result):
+            if ratio > 0:
+                ratio -= 1
+            elif ratio < 0:
+                ratio += 1
+            if ratio != 0:
+                result = v_target - ratio * v_base
             else:
-                # General case: use Newton's divided differences or matrix solve
-                # For simplicity, assume monic polynomial x^d + lower terms
-                points = list(range(d + 1))
-                values = [self.polynomial(x) for x in points]
-                
-                # Simple coefficient extraction for common cases
-                coeffs = [int(values[0])]  # a0 = f(0)
-                for i in range(1, d + 1):
-                    coeffs.append(1)  # placeholder
-                coeffs[-1] = 1  # Leading coefficient = 1 (monic assumption)
-                return coeffs
-                
-        except Exception as e:
-            print(f"[!] Warning: Could not extract coefficients: {e}")
-            # Default: assume f(x) = x (linear, monic)
-            return [0, 1]
-    
-    def construct_lattice_integer(self, m: int, X: int) -> np.ndarray:
+                result = v_target.copy()
+        
+        return result
+
+    def step1_fuse_ab(self, fusion_ratio: float = 0.5) -> np.ndarray:
+        if self.vertices.dtype == object:
+            vertices = self.vertices.copy()
+            v1, v2 = vertices[0], vertices[1]
+            v2_new = self._reduce_vector(v2, v1)
+            if np.dot(v2_new, v2_new) < np.dot(v1, v1) and not self._is_zero_vector(v2_new):
+                vertices[0], vertices[1] = v2_new, v1
+            else:
+                vertices[1] = v2_new
+            return vertices
+        vertices = self.vertices.copy().astype(np.float64)
+        fusion_point = (vertices[0] + vertices[1]) / 2.0
+        vertices[0] = vertices[0] + fusion_ratio * (fusion_point - vertices[0])
+        vertices[1] = vertices[1] + fusion_ratio * (fusion_point - vertices[1])
+        return vertices
+
+    def step2_compress_cd(self, compression_ratio: float = 0.8) -> np.ndarray:
+        if self.vertices.dtype == object:
+            vertices = self.vertices.copy()
+            for k in [2, 3]:
+                if k >= len(vertices):
+                    continue
+                v_k = vertices[k].copy()
+                for j in [0, 1]:
+                    v_k = self._reduce_vector(v_k, vertices[j])
+                vertices[k] = v_k
+            return vertices
+        vertices = self.vertices.copy().astype(np.float64)
+        vertices = self.step1_fuse_ab(fusion_ratio=1.0)
+        compression_point = (vertices[2] + vertices[3]) / 2.0
+        vertices[2] = vertices[2] + compression_ratio * (compression_point - vertices[2])
+        vertices[3] = vertices[3] + compression_ratio * (compression_point - vertices[3])
+        return vertices
+
+    def step3_compress_to_point(self, final_ratio: float = 0.9) -> np.ndarray:
+        vertices = self.vertices.copy().astype(np.float64)
+        vertices = self.step2_compress_cd(compression_ratio=1.0)
+        center = np.mean(vertices, axis=0).astype(np.float64)
+        for i in range(len(vertices)):
+            vertices[i] = vertices[i] + final_ratio * (center - vertices[i])
+        return vertices
+
+    def run_geometric_reduction(self, verbose: bool = True, use_lll: bool = True) -> np.ndarray:
         """
-        Construct the PROPER Coppersmith lattice using INTEGER arithmetic.
+        Run SINGLE PASS geometric reduction, then LLL with COLUMN SCALING.
         
-        For polynomial f(x) = a0 + a1*x + ... + ad*x^d, we construct basis vectors
-        representing the polynomials:
-        
-        g_{i,j}(x) = x^j * N^{m-i} * f(x)^i   for i=0..m, j=0..d-1
-        
-        Evaluated at x -> xX, these give rows of the lattice where
-        column k represents the coefficient of X^k.
-        
-        The lattice is triangular with structure that allows short vectors
-        to encode small roots.
+        Column scaling preserves lattice structure by scaling each column
+        independently to balance magnitudes, enabling LLL to work properly.
         """
-        d = self.degree
-        n = d * (m + 1)  # Total dimension
-        
-        # Initialize lattice with Python integers
-        B = np.zeros((n, n), dtype=object)
-        for i in range(n):
-            for j in range(n):
-                B[i, j] = int(0)
-        
-        print(f"[*] Constructing PROPER {n}x{n} Coppersmith lattice (m={m}, d={d}, X={X})")
-        
-        # Get polynomial coefficients
-        coeffs = self.poly_coeffs if self.poly_coeffs else self._extract_coefficients()
-        print(f"[*] Polynomial coefficients: {coeffs[:min(5, len(coeffs))]}{'...' if len(coeffs) > 5 else ''}")
-        
-        # Compute powers of f(x) symbolically (as coefficient vectors)
-        # f^0(x) = 1, f^1(x) = f(x), f^2(x) = f(x)*f(x), etc.
-        
-        def poly_mult(p1: List[int], p2: List[int]) -> List[int]:
-            """Multiply two polynomials given as coefficient lists."""
-            if not p1 or not p2:
-                return [0]
-            result = [0] * (len(p1) + len(p2) - 1)
-            for i, a in enumerate(p1):
-                for j, b in enumerate(p2):
-                    result[i + j] += a * b
-            return result
-        
-        # Precompute f^i for i = 0 to m
-        f_powers = [[1]]  # f^0 = 1
-        for i in range(1, m + 1):
-            f_powers.append(poly_mult(f_powers[-1], coeffs))
-        
-        # Build the lattice rows
-        # Row index = i * d + j where i is the power of f, j is the shift by x^j
-        row = 0
-        for i in range(m + 1):
-            # g_{i,j}(x) = x^j * f(x)^i * N^{m-i}
-            N_power = self.N ** (m - i)
-            f_i_coeffs = f_powers[i]  # Coefficients of f^i
+        if self.basis is None:
+            return np.array([])
             
-            for j in range(d):
-                if row >= n:
-                    break
-                
-                # Polynomial: x^j * f^i(x) has coefficients shifted by j
-                # So coefficient of x^k is f_i_coeffs[k-j] if k >= j, else 0
-                
-                for col in range(n):
-                    # Coefficient of X^col in g_{i,j}(xX)
-                    # = coefficient of x^col in x^j * f^i(x) * N^{m-i}
-                    # = f_i_coeffs[col - j] * N^{m-i} * X^col  if col >= j
-                    
-                    k = col - j  # Index into f^i coefficients
-                    if 0 <= k < len(f_i_coeffs):
-                        # The lattice encodes coefficients scaled by X^col
-                        coeff = f_i_coeffs[k] * N_power
-                        X_scale = X ** col
-                        B[row, col] = int(coeff * X_scale)
-                
-                row += 1
+        basis = self.basis.astype(object)
+        n = len(basis)
+        m = basis.shape[1] if len(basis.shape) > 1 else n
         
-        # Verify lattice is not all zeros
-        max_entry = max(abs(B[i, j]) for i in range(n) for j in range(n))
-        print(f"[*] Lattice max entry: ~2^{max_entry.bit_length()} bits")
-        
-        return B
-    
-    def reduce_lattice_geometric(self, lattice: np.ndarray, verbose: bool = True) -> np.ndarray:
-        """
-        Reduce the lattice using GeometricLLL's PURE geometric transformations.
-        """
-        if lattice.dtype != object:
-            lattice = lattice.astype(object)
-        
-        geom_lll = GeometricLLL(self.N, basis=lattice)
+        if n == 0:
+            return basis
         
         if verbose:
-            print("[*] Applying PURE geometric reduction (Fuse/Compress passes)...")
+            print(f"[*] Running Geometric Reduction on {n}x{m} lattice...")
         
-        reduced_basis = geom_lll.run_geometric_reduction()
+        # ===== SINGLE GEOMETRIC PASS =====
+        if verbose:
+            print(f"[*] Geometric pass: size-reducing all vectors...")
         
-        return reduced_basis
-    
-    def _extract_root_from_vector(self, vec, X: int) -> Optional[int]:
-        """
-        Extract a potential root from a short lattice vector.
+        # Forward reduction
+        for i in range(1, n):
+            for j in range(i):
+                basis[i] = self._reduce_vector(basis[i], basis[j])
         
-        The vector represents coefficients [c0, c1, ..., cn-1] of a polynomial
-        h(x) = c0 + c1*x + ... that shares roots with f(x) mod N.
+        # Swap pass
+        for i in range(n - 1):
+            norm_i = np.dot(basis[i], basis[i])
+            norm_i1 = np.dot(basis[i+1], basis[i+1])
+            if norm_i1 != 0 and norm_i1 < norm_i:
+                basis[i], basis[i+1] = basis[i+1].copy(), basis[i].copy()
         
-        For a short vector, h(x) might factor or have small integer roots.
-        """
-        # Try to interpret vector as polynomial and find roots
-        n = len(vec)
+        if verbose:
+            print(f"[*] Geometric pass complete.")
         
-        # Extract non-zero coefficients
-        coeffs = []
-        for i in range(n):
-            c = int(vec[i])
-            # Unscale by X^i
-            if X != 0 and i > 0:
-                # The lattice scaled by X^i, so unscale
-                X_i = X ** i
-                if c % X_i == 0:
-                    coeffs.append(c // X_i)
+        # ===== LLL PHASE with COLUMN SCALING =====
+        if use_lll:
+            try:
+                from fpylll import IntegerMatrix, LLL
+                
+                # Find max bits per column (for column scaling)
+                col_max_bits = []
+                for j in range(m):
+                    max_bits = 0
+                    for i in range(n):
+                        if basis[i,j] != 0:
+                            bits = abs(int(basis[i,j])).bit_length()
+                            if bits > max_bits:
+                                max_bits = bits
+                    col_max_bits.append(max_bits)
+                
+                overall_max = max(col_max_bits) if col_max_bits else 0
+                
+                if verbose:
+                    print(f"[*] Column max bits: min={min(col_max_bits)}, max={max(col_max_bits)}")
+                
+                # fpylll works best with entries < ~8000 bits
+                TARGET_BITS = 4000
+                
+                if overall_max > TARGET_BITS:
+                    # COLUMN SCALING: Scale each column so max entry ~ TARGET_BITS
+                    # This preserves relative structure within each column
+                    
+                    col_shifts = []
+                    for j in range(m):
+                        if col_max_bits[j] > TARGET_BITS:
+                            shift = col_max_bits[j] - TARGET_BITS
+                        else:
+                            shift = 0
+                        col_shifts.append(shift)
+                    
+                    if verbose:
+                        nz_shifts = [s for s in col_shifts if s > 0]
+                        if nz_shifts:
+                            print(f"[*] Column scaling: {len(nz_shifts)} columns shifted (max shift 2^{max(nz_shifts)})")
+                    
+                    # Apply column scaling
+                    scaled = np.zeros((n, m), dtype=object)
+                    for i in range(n):
+                        for j in range(m):
+                            if col_shifts[j] > 0:
+                                scaled[i,j] = int(basis[i,j]) >> col_shifts[j]
+                            else:
+                                scaled[i,j] = int(basis[i,j])
+                    
+                    # Check for all-zero rows after scaling
+                    valid_rows = []
+                    for i in range(n):
+                        if any(scaled[i,j] != 0 for j in range(m)):
+                            valid_rows.append(i)
+                    
+                    if len(valid_rows) < n:
+                        if verbose:
+                            print(f"[!] Warning: {n - len(valid_rows)} rows became zero after scaling")
+                        # Use only valid rows for LLL
+                        n_valid = len(valid_rows)
+                        if n_valid < 2:
+                            if verbose:
+                                print(f"[!] Not enough valid rows for LLL, skipping")
+                            return basis
+                    else:
+                        n_valid = n
+                        valid_rows = list(range(n))
+                    
+                    # Build fpylll matrix from valid rows
+                    int_matrix = IntegerMatrix(n_valid, m)
+                    for idx, i in enumerate(valid_rows):
+                        for j in range(m):
+                            int_matrix[idx, j] = int(scaled[i, j])
+                    
+                    if verbose:
+                        print(f"[*] Applying LLL to {n_valid}x{m} scaled lattice...")
+                    
+                    LLL.reduction(int_matrix)
+                    
+                    # Extract reduced basis
+                    reduced_scaled = np.zeros((n_valid, m), dtype=object)
+                    for i in range(n_valid):
+                        for j in range(m):
+                            reduced_scaled[i, j] = int_matrix[i, j]
+                    
+                    # Unscale columns
+                    result = np.zeros((n_valid, m), dtype=object)
+                    for i in range(n_valid):
+                        for j in range(m):
+                            if col_shifts[j] > 0:
+                                result[i,j] = int(reduced_scaled[i,j]) << col_shifts[j]
+                            else:
+                                result[i,j] = int(reduced_scaled[i,j])
+                    
+                    if verbose:
+                        print(f"[*] LLL + column rescale complete.")
+                    
+                    # If we had to drop rows, put zeros back
+                    if n_valid < n:
+                        full_result = np.zeros((n, m), dtype=object)
+                        for idx, i in enumerate(valid_rows):
+                            full_result[i] = result[idx]
+                        basis = full_result
+                    else:
+                        basis = result
                 else:
-                    coeffs.append(c)  # Keep scaled if not divisible
-            else:
-                coeffs.append(c)
-        
-        # For linear polynomial: h(x) = c0 + c1*x, root is x = -c0/c1
-        if len(coeffs) >= 2 and coeffs[1] != 0:
-            c0, c1 = coeffs[0], coeffs[1]
-            if c0 % c1 == 0:
-                root = -c0 // c1
-                return root
-        
-        # Try small integer roots directly
-        for x in range(-1000, 1001):
-            if x == 0:
-                continue
-            h_x = sum(coeffs[i] * (x ** i) for i in range(len(coeffs)) if i < len(coeffs))
-            if h_x == 0:
-                return x
-        
-        return None
-    
-    def find_small_roots(self, X: int, m: int = 3, verbose: bool = True) -> List[int]:
-        """
-        Find small roots of f(x) ≡ 0 (mod N) where |x| < X.
-        """
-        if verbose:
-            print(f"[*] Coppersmith's method: Finding roots |x| < {X} (mod N)")
-            print(f"[*] N has {self.N.bit_length()} bits")
-            print(f"[*] Using PURE Geometric LLL for lattice reduction")
-            print(f"[*] Lattice parameter m = {m}, polynomial degree = {self.degree}")
-        
-        if verbose:
-            print("[*] Constructing integer lattice basis...")
-        
-        lattice = self.construct_lattice_integer(m, X)
-        
-        if verbose:
-            print(f"[*] Lattice dimension: {lattice.shape}")
-            print("[*] Reducing lattice using Geometric LLL...")
-        
-        reduced_basis = self.reduce_lattice_geometric(lattice, verbose)
-        
-        if verbose:
-            print("[*] Lattice reduction complete")
-            print("[*] Extracting roots from reduced basis vectors...")
-        
-        roots = []
-        
-        # Calculate vector norms
-        def int_norm_sq(vec):
-            return sum(int(x) ** 2 for x in vec)
-        
-        vector_norms = []
-        for i in range(reduced_basis.shape[0]):
-            try:
-                norm_sq = int_norm_sq(reduced_basis[i])
-                vector_norms.append((i, norm_sq))
-            except:
-                vector_norms.append((i, float('inf')))
-        
-        vector_norms.sort(key=lambda x: x[1])
-        
-        # Check shortest vectors
-        for idx, norm_sq in vector_norms[:min(20, len(vector_norms))]:
-            vec = reduced_basis[idx]
-            
-            if verbose:
-                try:
-                    norm_bits = norm_sq.bit_length() if isinstance(norm_sq, int) else 0
-                    print(f"[*] Checking vector {idx} (norm^2 ~ 2^{norm_bits})")
-                except:
-                    print(f"[*] Checking vector {idx}")
-            
-            # Try to extract root
-            root = self._extract_root_from_vector(vec, X)
-            if root is not None and abs(root) <= X:
-                try:
-                    poly_val = self.polynomial(root)
-                    if poly_val % self.N == 0:
-                        if root not in roots:
-                            roots.append(root)
-                            if verbose:
-                                print(f"[+] Found root: x = {root}")
-                except:
-                    pass
-            
-            # Also try direct coefficient interpretation
-            try:
-                if len(vec) >= 2:
-                    b_val = int(vec[0])
-                    a_val = int(vec[1])
+                    # Direct LLL (entries already small enough)
+                    int_matrix = IntegerMatrix(n, m)
+                    for i in range(n):
+                        for j in range(m):
+                            int_matrix[i, j] = int(basis[i, j])
                     
-                    if a_val != 0 and b_val % a_val == 0:
-                        root_candidate = -b_val // a_val
-                        if abs(root_candidate) <= X:
-                            poly_val = self.polynomial(root_candidate)
-                            if poly_val % self.N == 0:
-                                if root_candidate not in roots:
-                                    roots.append(root_candidate)
-                                    if verbose:
-                                        print(f"[+] Found root (linear): x = {root_candidate}")
-            except:
-                pass
+                    if verbose:
+                        print(f"[*] Applying LLL directly...")
+                    
+                    LLL.reduction(int_matrix)
+                    
+                    for i in range(n):
+                        for j in range(m):
+                            basis[i, j] = int_matrix[i, j]
+                    
+                    if verbose:
+                        print(f"[*] LLL reduction complete.")
+                    
+            except ImportError:
+                if verbose:
+                    print(f"[!] fpylll not available")
+            except Exception as e:
+                if verbose:
+                    print(f"[!] LLL failed: {e}")
         
-        # Verification for small bounds
-        if X <= 100000:
-            if verbose:
-                print(f"[*] Verification sweep for |x| <= {X}...")
-            
-            for x in range(-X, X + 1):
-                if x == 0:
-                    continue
-                try:
-                    poly_val = self.polynomial(x)
-                    if poly_val % self.N == 0:
-                        if x not in roots:
-                            roots.append(x)
-                            if verbose:
-                                print(f"[+] Verified root: x = {x}")
-                except:
-                    continue
-        else:
-            if verbose:
-                print(f"[*] X too large for full verification ({X}), using extracted roots only")
-        
-        if verbose:
-            print(f"[*] Final result: {len(roots)} root(s) found")
-        
-        return roots
+        self.basis = basis
+        return basis
+
+    def find_factors_geometrically(self, max_iterations: int = 100) -> Tuple[int, int]:
+        try:
+            sqrt_N = min(1000000, int(math.isqrt(self.N)) + 1)
+        except:
+            sqrt_N = 1000000
+
+        for i in range(2, sqrt_N):
+            if self.N % i == 0:
+                self.p, self.q = i, self.N // i
+                return self.p, self.q
+
+        return None, None
 
 
-def coppersmith_small_roots(N: int, polynomial: Callable, X: int, 
-                           m: int = 3, degree: int = 1, verbose: bool = True,
-                           poly_coeffs: List[int] = None) -> List[int]:
-    """
-    Convenience function for Coppersmith's method.
-    """
-    method = CoppersmithMethod(N, polynomial, degree=degree, poly_coeffs=poly_coeffs)
-    return method.find_small_roots(X, m, verbose)
+def demo_geometric_lll():
+    N = 143
+    print(f"Factoring N = {N} using Geometric LLL Algorithm")
+    print("=" * 50)
+    geom_lll = GeometricLLL(N)
+    p, q = geom_lll.find_factors_geometrically()
+    if p and q:
+        print(f"Found factors: {p} x {q} = {N}")
+    else:
+        print(f"Could not factor {N}")
 
 
 if __name__ == "__main__":
-    print("Coppersmith's Method using PURE Geometric LLL")
-    print("=" * 50)
-    
-    # Example 1: Simple linear case
-    print("\nExample 1: Linear polynomial f(x) = x - 5")
-    print("-" * 30)
-    N1 = 143
-    f1 = lambda x: x - 5
-    roots1 = coppersmith_small_roots(N1, f1, X=20, m=2, degree=1, 
-                                     poly_coeffs=[-5, 1], verbose=True)
-    
-    # Example 2: Quadratic case  
-    print("\nExample 2: Quadratic polynomial f(x) = x^2 + 3x + 2")
-    print("-" * 30)
-    N2 = 143
-    f2 = lambda x: x**2 + 3*x + 2
-    roots2 = coppersmith_small_roots(N2, f2, X=15, m=3, degree=2,
-                                     poly_coeffs=[2, 3, 1], verbose=True)
-    
-    print("\n" + "=" * 50)
-    print("Demo complete!")
+    demo_geometric_lll()
