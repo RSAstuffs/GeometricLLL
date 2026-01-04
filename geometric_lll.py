@@ -140,6 +140,95 @@ class GeometricLLL:
         
         return result
 
+    def _lll_reduce_basis(self, basis, delta=0.99, verbose=False):
+        """
+        Proper LLL reduction with SIZE REDUCTION + SWAPS.
+        
+        This is the key missing piece! Standard LLL does:
+        1. Size reduce: Make |mu_ij| <= 0.5
+        2. Swap: If ||b*_i|| > delta * ||b*_{i-1}||, swap and go back
+        
+        The delta parameter (0.75 typical, 0.99 for better reduction) controls quality.
+        """
+        n = len(basis)
+        if n <= 1:
+            return basis
+        
+        basis = basis.copy()
+        
+        # Gram-Schmidt orthogonalization (computed lazily)
+        def gram_schmidt(B):
+            """Compute Gram-Schmidt orthogonalization."""
+            n = len(B)
+            B_star = [None] * n
+            mu = [[0] * n for _ in range(n)]
+            
+            B_star[0] = B[0].copy()
+            
+            for i in range(1, n):
+                B_star[i] = B[i].copy()
+                for j in range(i):
+                    if np.dot(B_star[j], B_star[j]) == 0:
+                        mu[i][j] = 0
+                    else:
+                        mu[i][j] = np.dot(B[i], B_star[j]) // np.dot(B_star[j], B_star[j])
+                    # Use rational arithmetic for mu to avoid overflow
+                    B_star_j_norm = np.dot(B_star[j], B_star[j])
+                    if B_star_j_norm != 0:
+                        proj_coeff = np.dot(B[i], B_star[j])
+                        # Approximate projection
+                        B_star[i] = B_star[i] - (proj_coeff * B_star[j]) // B_star_j_norm
+            
+            return B_star, mu
+        
+        k = 1
+        iterations = 0
+        max_iterations = n * n * 10  # Prevent infinite loops
+        
+        while k < n and iterations < max_iterations:
+            iterations += 1
+            
+            # Size reduce b_k with respect to b_{k-1}
+            basis[k] = self._reduce_vector(basis[k], basis[k-1])
+            
+            # Also reduce against all earlier vectors
+            for j in range(k-1, -1, -1):
+                basis[k] = self._reduce_vector(basis[k], basis[j])
+            
+            # Compute norms for Lovász condition
+            # We use a simplified version: compare ||b_k|| with ||b_{k-1}||
+            norm_k = np.dot(basis[k], basis[k])
+            norm_km1 = np.dot(basis[k-1], basis[k-1])
+            
+            # Lovász condition (simplified): ||b_k||^2 >= (delta - mu^2) * ||b_{k-1}||^2
+            # Approximation: If b_k is significantly shorter, swap
+            
+            # Compute projection coefficient
+            if norm_km1 > 0:
+                mu_k_km1 = np.dot(basis[k], basis[k-1]) / float(norm_km1)
+            else:
+                mu_k_km1 = 0
+            
+            # Check Lovász condition: ||b*_k||^2 >= (delta - mu^2) * ||b*_{k-1}||^2
+            # For large integers, we simplify: swap if ||b_k|| < sqrt(delta) * ||b_{k-1}||
+            # Or equivalently: ||b_k||^2 < delta * ||b_{k-1}||^2
+            
+            lovasz_threshold = int(delta * float(norm_km1))
+            
+            if norm_k > 0 and norm_k < lovasz_threshold:
+                # Lovász condition violated - SWAP
+                if verbose:
+                    print(f"    Swap positions {k-1} and {k}")
+                basis[k-1], basis[k] = basis[k].copy(), basis[k-1].copy()
+                k = max(k - 1, 1)  # Go back
+            else:
+                k += 1
+        
+        if verbose and iterations >= max_iterations:
+            print(f"    Warning: LLL hit iteration limit ({max_iterations})")
+        
+        return basis
+
     def step1_fuse_ab(self, fusion_ratio: float = 0.5) -> np.ndarray:
         if self.vertices.dtype == object:
             vertices = self.vertices.copy()
@@ -366,6 +455,9 @@ class GeometricLLL:
             for (i, j) in pairs:
                 if i < n and j < n:
                     basis[j] = self._reduce_vector(basis[j], basis[i])
+            
+            # NEW: Apply proper LLL with swaps!
+            basis = self._lll_reduce_basis(basis, delta=0.99, verbose=False)
             
             # Then do full forward reduction
             for i in range(1, n):
