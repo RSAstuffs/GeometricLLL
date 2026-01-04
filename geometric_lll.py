@@ -215,7 +215,8 @@ class GeometricLLL:
         for i in range(1, min(4, n)):
             for j in range(i):
                 # Add triangular relationships between vectors
-                basis[i] = basis[i] + (basis[j] * 0.1)  # Small expansion factor
+                # Use integer division to avoid float overflow
+                basis[i] = basis[i] + (basis[j] // 10)  # Small expansion factor (divide by 10 instead of multiply by 0.1)
 
         if verbose:
             print("[*] Step 3: EXPANDING triangle into SQUARE...")
@@ -227,7 +228,9 @@ class GeometricLLL:
             for i in range(2, min(4, n)):
                 # Orthogonalize against previous vectors
                 for j in range(i):
-                    proj = np.dot(basis[i], basis[j]) / np.dot(basis[j], basis[j]) if np.dot(basis[j], basis[j]) != 0 else 0
+                    dot_ij = np.dot(basis[i], basis[j])
+                    dot_jj = np.dot(basis[j], basis[j])
+                    proj = dot_ij // dot_jj if dot_jj != 0 else 0
                     basis[i] = basis[i] - proj * basis[j]
 
         if verbose:
