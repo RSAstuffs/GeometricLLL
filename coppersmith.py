@@ -14,6 +14,7 @@ Author: AI Assistant
 """
 
 import sys
+import math
 import importlib.util
 from typing import List, Tuple, Optional, Callable
 import numpy as np
@@ -197,155 +198,85 @@ class CoppersmithMethod:
         except:
             return [0.0, 1.0]
     
-    def reduce_lattice_geometric(self, lattice: np.ndarray) -> np.ndarray:
+    def reduce_lattice_geometric(self, lattice: np.ndarray, verbose: bool = False) -> np.ndarray:
         """
-        Reduce the lattice using GeometricLLL's geometric transformations ONLY.
+        Reduce the lattice using GeometricLLL's geometric transformations.
         
-        This method uses GeometricLLL's geometric transformation methods
-        (fuse, compress) to perform lattice basis reduction. NO traditional
-        LLL or Gram-Schmidt is used - only the geometric transformations.
-        
-        Uses arbitrary precision arithmetic to prevent precision loss for large numbers.
+        This method uses the GeometricLLL class which has been updated to perform
+        valid lattice reduction operations (Gauss/Lagrange reduction and Size Reduction)
+        mapped to the geometric concepts of "Fusing" and "Compressing".
         
         Args:
             lattice: Input lattice basis
+            verbose: Whether to print progress
             
         Returns:
-            Reduced lattice basis using geometric transformations
+            Reduced lattice basis
         """
-        # Initialize GeometricLLL with our modulus (this sets up arbitrary precision)
+        # Initialize GeometricLLL
         geom_lll = GeometricLLL(self.N)
         
-        # For large numbers, use integer arithmetic and convert carefully
-        # Don't convert to float immediately - preserve precision
-        n_rows, n_cols = lattice.shape
+        # Work with a copy to avoid modifying original
+        # Use object type for arbitrary precision integers
+        reduced_basis = lattice.copy().astype(object)
+        n_rows = reduced_basis.shape[0]
         
-        # Check if we need arbitrary precision
-        max_val = np.max(np.abs(lattice))
-        use_high_precision = max_val > 1e15 or self.N.bit_length() > 512
+        # We will process the lattice in a sliding window of 4 vectors
+        # to apply the geometric transformations (Fuse A+B, Compress C+D)
         
-        if use_high_precision:
-            # Use integer-based operations, convert to float only for geometric ops
-            # Store original as integers
-            reduced_basis_int = lattice.copy()
-            # For geometric operations, we'll work with scaled versions
-            # Scale factor to bring values into reasonable range for geometric ops
-            if max_val > 1e300:
-                # Use integer division for very large numbers to avoid float overflow
-                scale_factor = max_val // 10**10
-            else:
-                scale_factor = max(1.0, max_val / 1e10)
+        # Multiple passes for better reduction
+        # Increase passes to ensure convergence for higher dimensions
+        max_passes = 200
+        for iteration in range(max_passes):
+            changed = False
             
-            # Ensure scale_factor is not zero
-            if scale_factor == 0:
-                scale_factor = 1.0
+            # Sliding window of size 4 (or less at the end)
+            for i in range(0, n_rows - 1):
+                # Extract window of up to 4 vectors
+                window_size = min(4, n_rows - i)
+                if window_size < 2: break
                 
-            reduced_basis = (lattice / scale_factor).astype(np.float64)
-        else:
-            # For smaller numbers, standard float is fine
-            reduced_basis = lattice.copy().astype(np.float64)
-            scale_factor = 1.0
-        
-        # Helper function to safely extract 2D projection from a row
-        def safe_extract_2d(row_idx):
-            """Safely extract first 2 components from a row, padding with 0 if needed."""
-            if row_idx >= n_rows or row_idx < 0:
-                return np.array([0.0, 0.0])
-            try:
-                row = reduced_basis[row_idx]
-                if n_cols >= 2:
-                    return row[:2].copy()
-                elif n_cols == 1:
-                    return np.array([float(row[0]), 0.0])
-                else:
-                    return np.array([0.0, 0.0])
-            except (IndexError, ValueError):
-                return np.array([0.0, 0.0])
-        
-        # Map lattice basis vectors to geometric vertices and apply transformations
-        # We'll process the lattice in groups of 4 (since GeometricLLL uses 4 vertices)
-        
-        # Process rows in batches, using geometric transformations
-        for iteration in range(min(5, n_rows)):  # Multiple iterations for better reduction
-            # Process pairs/groups using geometric transformations
-            for i in range(0, n_rows - 1, 2):
-                # Verify bounds before accessing
-                if i >= n_rows or i + 1 >= n_rows:
-                    continue
-                    
-                # Map first two basis vectors to vertices A and B
-                # Extract 2D projections for geometric operations
+                # Create a temporary view for GeometricLLL
+                # ...existing code...
                 
-                v1_2d = safe_extract_2d(i)
-                v2_2d = safe_extract_2d(i + 1)
-                v3_2d = safe_extract_2d(i + 2) if i + 2 < n_rows else np.array([0.0, 0.0])
-                v4_2d = safe_extract_2d(i + 3) if i + 3 < n_rows else np.array([0.0, 0.0])
+                # Extract vectors
+                vectors = []
+                for j in range(window_size):
+                    vectors.append(reduced_basis[i+j])
                 
-                # Set vertices for geometric transformation
-                geom_lll.vertices = np.array([v1_2d, v2_2d, v3_2d, v4_2d], dtype=np.float64)
+                # Pad with zeros if less than 4 vectors (GeometricLLL expects 4)
+                while len(vectors) < 4:
+                    vectors.append(np.zeros_like(reduced_basis[0]))
                 
-                # Apply Step 1: Fuse A and B (this reduces the angle between vectors)
-                fused_vertices = geom_lll.step1_fuse_ab(fusion_ratio=0.6)
+                # Set vertices in GeometricLLL
+                geom_lll.vertices = np.array(vectors, dtype=object)
                 
-                # Map fused vertices back to lattice basis
-                # The fusion operation brings vectors closer together (reduction)
-                # Only update if we have enough columns
-                if n_cols >= 2:
-                    if i < n_rows:
-                        reduced_basis[i][:2] = fused_vertices[0][:2]
-                    if i + 1 < n_rows:
-                        reduced_basis[i+1][:2] = fused_vertices[1][:2]
-                    if i + 2 < n_rows:
-                        reduced_basis[i+2][:2] = fused_vertices[2][:2]
-                    if i + 3 < n_rows:
-                        reduced_basis[i+3][:2] = fused_vertices[3][:2]
+                # Apply Step 1: Fuse A and B (Gauss Reduction on v1, v2)
+                # This modifies vertices[0] and vertices[1]
+                geom_lll.vertices = geom_lll.step1_fuse_ab()
+                
+                # Apply Step 2: Compress C and D (Size Reduction against A, B)
+                # This modifies vertices[2] and vertices[3]
+                geom_lll.vertices = geom_lll.step2_compress_cd()
+                
+                # Apply Step 3: Final Compression (Size Reduction of D against C)
+                geom_lll.vertices = geom_lll.step3_compress_to_point()
+                
+                # Update the basis with the transformed vectors
+                for j in range(window_size):
+                    # Check if changed
+                    if not np.array_equal(reduced_basis[i+j], geom_lll.vertices[j]):
+                        reduced_basis[i+j] = geom_lll.vertices[j]
+                        changed = True
             
-            # Apply Step 2: Compress operations on remaining vectors
-            for i in range(2, n_rows - 1, 2):
-                if i + 1 >= n_rows:
-                    continue
-                    
-                # Set up vertices with first two already processed, now compress C and D
-                # Use safe extraction function
-                v1_2d = safe_extract_2d(0) if n_rows > 0 else np.array([0.0, 0.0])
-                v2_2d = safe_extract_2d(1) if n_rows > 1 else np.array([0.0, 0.0])
-                v3_2d = safe_extract_2d(i)
-                v4_2d = safe_extract_2d(i + 1)
+            if not changed:
+                if verbose:
+                    print(f"[*] Lattice reduction converged after {iteration+1} passes")
+                break
+            elif iteration == max_passes - 1:
+                if verbose:
+                    print(f"[*] Lattice reduction stopped after max passes ({max_passes})")
                 
-                geom_lll.vertices = np.array([v1_2d, v2_2d, v3_2d, v4_2d], dtype=np.float64)
-                
-                # First ensure A and B are fused (for step2 to work properly)
-                geom_lll.vertices = geom_lll.step1_fuse_ab(fusion_ratio=1.0)
-                
-                # Apply Step 2: Compress C and D
-                compressed_vertices = geom_lll.step2_compress_cd(compression_ratio=0.6)
-                
-                # Map compressed vertices back (only if we have enough columns)
-                if n_cols >= 2:
-                    if i < n_rows:
-                        reduced_basis[i][:2] = compressed_vertices[2][:2]
-                    if i + 1 < n_rows:
-                        reduced_basis[i+1][:2] = compressed_vertices[3][:2]
-        
-        # Final compression step: compress everything towards center
-        # This is analogous to step3_compress_to_point but applied to the lattice
-        for i in range(n_rows):
-            if i < n_rows - 1:
-                # Use geometric compression on pairs
-                v1_2d = safe_extract_2d(i)
-                v2_2d = safe_extract_2d(i + 1)
-                
-                geom_lll.vertices = np.array([v1_2d, v2_2d, v1_2d * 0.5, v2_2d * 0.5], dtype=np.float64)
-                geom_lll.vertices = geom_lll.step1_fuse_ab(fusion_ratio=1.0)
-                final_vertices = geom_lll.step3_compress_to_point(final_ratio=0.3)
-                
-                # Only update if we have enough columns
-                if n_cols >= 2:
-                    if i < n_rows:
-                        reduced_basis[i][:2] = final_vertices[0][:2]
-                    if i + 1 < n_rows:
-                        reduced_basis[i+1][:2] = final_vertices[1][:2]
-        
         return reduced_basis
     
     def find_small_roots(self, X: int, m: int = 3, verbose: bool = True) -> List[int]:
@@ -377,28 +308,17 @@ class CoppersmithMethod:
             print(f"[*] Max entry in lattice: {max_entry}")
             print(f"[*] Max entry type: {type(max_entry)}")
         
-        if max_entry > 1e10:  # Scale if entries are too large
-            if max_entry > 1e300:
-                scale_factor = max_entry // 10**6
-            else:
-                scale_factor = max_entry / 1e6  # Bring to reasonable range
-                
-            lattice_scaled = lattice / scale_factor
-            if verbose:
-                if isinstance(scale_factor, int) and scale_factor > 1e300:
-                    print(f"[*] Scaled lattice by factor 10^{len(str(scale_factor))-1} to avoid overflow")
-                else:
-                    print(f"[*] Scaled lattice by factor {scale_factor:.2e} to avoid overflow")
-        else:
-            lattice_scaled = lattice
-            scale_factor = 1.0
+        # GeometricLLL now handles arbitrary precision integers correctly
+        # No scaling needed
+        lattice_scaled = lattice
+        scale_factor = 1.0
 
         if verbose:
             print(f"[*] Lattice dimension: {lattice.shape}")
             print("[*] Reducing lattice using Geometric LLL...")
 
-        # Reduce scaled lattice using GeometricLLL
-        reduced_basis = self.reduce_lattice_geometric(lattice_scaled)
+        # Reduce lattice using GeometricLLL
+        reduced_basis = self.reduce_lattice_geometric(lattice_scaled, verbose=verbose)
 
         # Do NOT unscale the reduced basis here as it causes overflow for large factors
         # We will handle unscaling element-wise during extraction
@@ -407,17 +327,20 @@ class CoppersmithMethod:
             print("[*] Lattice reduction complete")
             # Check if reduced basis has become all zeros (precision loss)
             max_reduced = np.max(np.abs(reduced_basis))
-            min_reduced = np.min(np.abs(reduced_basis[reduced_basis != 0])) if np.any(reduced_basis != 0) else 0
-            print(f"    Reduced basis stats: max={max_reduced:.2e}, min(non-zero)={min_reduced:.2e}")
-            if max_reduced < 1e-10:
+            # Handle object arrays for min/max
+            if np.any(reduced_basis != 0):
+                non_zeros = reduced_basis[reduced_basis != 0]
+                min_reduced = min(abs(x) for x in non_zeros.flatten())
+            else:
+                min_reduced = 0
+            print(f"    Reduced basis stats: max={max_reduced}, min(non-zero)={min_reduced}")
+            if max_reduced == 0:
                 print("[!] WARNING: Reduced basis appears to be all zeros - precision loss detected!")
-                print("    This may be due to catastrophic cancellation in floating-point operations.")
-                print("    Consider using arbitrary precision arithmetic (mpmath) for large numbers.")
             print("[*] Extracting factors from reduced basis using GeometricLLL.solve_to_front()...")
         
         # Check if we're dealing with large numbers that need high precision
         max_val = np.max(np.abs(reduced_basis))
-        use_high_precision = max_val > 1e15 or self.N.bit_length() > 512
+        use_high_precision = True # Always use high precision for object arrays
         
         # Convert reduced basis to list format for GeometricLLL
         # Each row of the reduced basis is a vector
@@ -427,32 +350,13 @@ class CoppersmithMethod:
             vec = []
             for j in range(reduced_basis.shape[1]):
                 val = reduced_basis[i, j]
-                # For very large numbers, try to preserve precision
-                if use_high_precision and scale_factor != 1:
-                    # Try to recover integer value from scaled version
-                    # Use Decimal to handle potential float overflow
-                    try:
-                        scaled_val = Decimal(float(val)) * Decimal(scale_factor)
-                        int_val = int(round(scaled_val))
-                        vec.append(int_val)
-                    except (OverflowError, ValueError, Exception):
-                        # Fallback
-                        try:
-                            vec.append(int(val * scale_factor))
-                        except:
-                            vec.append(0)
-                else:
-                    # For smaller numbers, convert to int if close to integer
-                    if abs(val - round(val)) < 1e-6:
-                        vec.append(int(round(val)))
-                    else:
-                        vec.append(int(round(val)))  # Still convert to int for GCD
+                vec.append(int(val))
+            
             # Only add non-zero vectors (skip all-zero vectors)
-            # Use a small threshold to avoid filtering out vectors that are just very small
-            if any(abs(x) > 1e-10 for x in vec):
+            if any(x != 0 for x in vec):
                 basis_list.append(vec)
             elif verbose and i < 5:  # Only print first few for debugging
-                print(f"    Skipping vector {i}: all components near zero (max abs: {max(abs(x) for x in vec) if vec else 0:.2e})")
+                print(f"    Skipping vector {i}: all components zero")
         
         if verbose:
             print(f"[*] Converted {len(basis_list)} non-zero vectors from reduced basis")
@@ -491,7 +395,13 @@ class CoppersmithMethod:
         roots = []
         
         # Sort vectors by length (shortest first)
-        vector_lengths = [np.linalg.norm(reduced_basis[i]) for i in range(reduced_basis.shape[0])]
+        # Use manual norm calculation for object arrays of large integers
+        vector_lengths = []
+        for i in range(reduced_basis.shape[0]):
+            vec = reduced_basis[i]
+            sq_norm = sum(x*x for x in vec)
+            vector_lengths.append(math.isqrt(sq_norm))
+            
         sorted_indices = sorted(range(len(vector_lengths)), key=lambda i: vector_lengths[i])
         
         # Check the shortest vectors (they are most likely to encode roots)
@@ -500,7 +410,15 @@ class CoppersmithMethod:
             vec_norm = vector_lengths[idx]
             
             if verbose:
-                print(f"[*] Checking vector {idx} (norm = {vec_norm:.2e})")
+                # Handle large integer formatting
+                if isinstance(vec_norm, int) and vec_norm > 10**300:
+                    norm_str = f"{str(vec_norm)[:5]}e+{len(str(vec_norm))-1}"
+                else:
+                    try:
+                        norm_str = f"{vec_norm:.2e}"
+                    except OverflowError:
+                        norm_str = f"{str(vec_norm)[:5]}e+{len(str(vec_norm))-1}"
+                print(f"[*] Checking vector {idx} (norm = {norm_str})")
             
             # Extract root from the vector
             # The vector represents coefficients of a polynomial h(x)
@@ -520,65 +438,135 @@ class CoppersmithMethod:
             # We want roots of h(x), which are X * roots of H(y)
             
             # Try linear interpolation first (using first 2 points)
+            # H(y) = a*y + b
+            # We use integer arithmetic to avoid overflow
             if len(vec) >= 2:
                 try:
-                    v0 = float(vec[0])
-                    v1 = float(vec[1])
-                    if abs(v1 - v0) > 1e-10:
-                        # H(y) = a*y + b
-                        # b = v0
-                        # a = v1 - v0
-                        # root y = -b/a = -v0 / (v1 - v0)
-                        root_y = -v0 / (v1 - v0)
-                        root_x = root_y * X
+                    v0 = int(vec[0])
+                    v1 = int(vec[1])
+                    
+                    # H(0) = b = v0
+                    # H(1) = a + b = v1  =>  a = v1 - v0
+                    b = v0
+                    a = v1 - v0
+                    
+                    if a != 0:
+                        # root y = -b/a
+                        # root x = y * X = (-b * X) / a
+                        # Check if result is integer
+                        numerator = -b * X
+                        denominator = a
                         
-                        # Check if close to integer
-                        if abs(root_x - round(root_x)) < 0.1:
-                            root_int = int(round(root_x))
+                        if numerator % denominator == 0:
+                            root_int = numerator // denominator
                             if abs(root_int) <= X:
-                                poly_val = self.polynomial(root_int)
-                                if poly_val % self.N == 0:
-                                    if root_int not in roots:
-                                        roots.append(root_int)
-                                        if verbose:
-                                            print(f"[+] Found root from linear interpolation: x = {root_int}")
-                except (ValueError, OverflowError, ZeroDivisionError):
-                    pass
+                                # Verify root
+                                try:
+                                    poly_val = self.polynomial(root_int)
+                                    if poly_val % self.N == 0:
+                                        if root_int not in roots:
+                                            roots.append(root_int)
+                                            if verbose:
+                                                print(f"[+] Found root from linear interpolation: x = {root_int}")
+                                except:
+                                    pass
+                except Exception as e:
+                    if verbose:
+                        print(f"    Linear interpolation error: {e}")
 
             # Try quadratic interpolation (using first 3 points)
+            # H(y) = a*y^2 + b*y + c
             if len(vec) >= 3:
                 try:
-                    v0, v1, v2 = float(vec[0]), float(vec[1]), float(vec[2])
-                    # Fit H(y) = ay^2 + by + c to (0, v0), (1, v1), (2, v2)
-                    # c = v0
-                    # a + b + c = v1
-                    # 4a + 2b + c = v2
-                    # 2a = v2 - 2v1 + v0 => a = (v2 - 2v1 + v0) / 2
-                    # b = v1 - v0 - a
+                    v0 = int(vec[0])
+                    v1 = int(vec[1])
+                    v2 = int(vec[2])
+                    
+                    # H(0) = c = v0
+                    # H(1) = a + b + c = v1
+                    # H(2) = 4a + 2b + c = v2
                     
                     c = v0
-                    a = (v2 - 2*v1 + v0) / 2.0
-                    b = v1 - v0 - a
+                    # 2a = v2 - 2v1 + v0
+                    two_a = v2 - 2*v1 + v0
                     
-                    if abs(a) > 1e-10:
-                        discriminant = b*b - 4*a*c
-                        if discriminant >= 0:
-                            sqrt_disc = np.sqrt(discriminant)
-                            for sign in [-1, 1]:
-                                root_y = (-b + sign * sqrt_disc) / (2 * a)
-                                root_x = root_y * X
+                    if two_a % 2 == 0:
+                        a = two_a // 2
+                        b = (v1 - v0) - a
+                        
+                        if a != 0:
+                            # Quadratic formula: y = (-b +/- sqrt(b^2 - 4ac)) / 2a
+                            discriminant = b*b - 4*a*c
+                            if discriminant >= 0:
+                                sqrt_d = math.isqrt(discriminant)
+                                if sqrt_d * sqrt_d == discriminant:
+                                    for sign in [-1, 1]:
+                                        num = -b + sign * sqrt_d
+                                        den = 2 * a
+                                        if num % den == 0:
+                                            y = num // den
+                                            root_int = y * X
+                                            if abs(root_int) <= X:
+                                                try:
+                                                    poly_val = self.polynomial(root_int)
+                                                    if poly_val % self.N == 0:
+                                                        if root_int not in roots:
+                                                            roots.append(root_int)
+                                                            if verbose:
+                                                                print(f"[+] Found root from quadratic interpolation: x = {root_int}")
+                                                except:
+                                                    pass
+                except Exception as e:
+                    if verbose:
+                        print(f"    Quadratic interpolation error: {e}")
+
+            # Try higher degree interpolation (up to degree 10) using floats as fallback
+            # Only if values are small enough
+            try:
+                max_val = max(abs(int(x)) for x in vec[:11])
+                if max_val < 1e300:
+                    max_interp_degree = min(10, len(vec) - 1)
+                    for deg in range(3, max_interp_degree + 1):
+                        # ...existing code...
+                        try:
+                            # Take first deg+1 points
+                            y_vals = [float(vec[k]) for k in range(deg + 1)]
+                            x_vals = list(range(deg + 1))
+                            
+                            # Fit polynomial
+                            # Note: polyfit returns coefficients [c_deg, ..., c_0]
+                            coeffs = np.polyfit(x_vals, y_vals, deg)
+                            
+                            # Find roots of the polynomial
+                            poly_roots = np.roots(coeffs)
+                            
+                            for r in poly_roots:
+                                # Check if root is real
+                                if np.iscomplex(r):
+                                    continue
                                 
+                                r_real = r.real
+                                # root_y is the root in the transformed domain (0, 1, 2...)
+                                # root_x = root_y * X
+                                root_x = r_real * X
+                                
+                                # Check if close to integer
                                 if abs(root_x - round(root_x)) < 0.1:
                                     root_int = int(round(root_x))
-                                    if abs(root_int) <= X:
-                                        poly_val = self.polynomial(root_int)
-                                        if poly_val % self.N == 0:
-                                            if root_int not in roots:
-                                                roots.append(root_int)
-                                                if verbose:
-                                                    print(f"[+] Found root from quadratic interpolation: x = {root_int}")
-                except (ValueError, OverflowError, ZeroDivisionError):
-                    pass
+                                    if abs(root_int) <= X and root_int != 0:
+                                        try:
+                                            poly_val = self.polynomial(root_int)
+                                            if poly_val % self.N == 0:
+                                                if root_int not in roots:
+                                                    roots.append(root_int)
+                                                    if verbose:
+                                                        print(f"[+] Found root from degree-{deg} interpolation: x = {root_int}")
+                                        except:
+                                            pass
+                        except Exception:
+                            pass
+            except:
+                pass
         
         if verbose:
             if roots:
